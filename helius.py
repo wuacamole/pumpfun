@@ -195,6 +195,62 @@ _HUMAN_SOL_THRESHOLD = 0.05
 _READER_EOF = object()
 
 
+def is_direct_pump_call(logs: list[str]) -> bool:
+    """True if the Pump program is invoked at the TOP level (depth [1]) of the tx
+    — a direct contract call with no router/aggregator/bot program wrapping it.
+    This is the paper's ``isBot`` (autonomous sniper). Parsed from the
+    logsSubscribe ``logs`` we already receive, so zero extra RPC. Returns False
+    when Pump appears only nested (routed via another program: the pump.fun
+    frontend, Jupiter, a telegram bot, etc.)."""
+    marker = f"Program {PUMP_PROGRAM_ID} invoke [1]"
+    return any(line.startswith(marker) for line in logs)
+
+
+# Runtime/infra programs that may appear at depth [1] before the real swap entry
+# (compute-budget setup, ATA creation, SOL/token transfers) — skipped so we
+# capture the program that actually drives the trade.
+_INFRA_PROGRAMS: set[str] = {
+    "ComputeBudget111111111111111111111111111111",
+    "11111111111111111111111111111111",            # System
+    "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL",  # Associated Token Account
+    "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",   # SPL Token
+    "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",   # Token-2022
+}
+
+# Identified entry programs -> human-readable route name. Pure program identities
+# (no human/bot semantics baked in); "other" covers anything unidentified. Used
+# only at analysis/retrain time — the raw entry program is what's stored.
+_ROUTE_NAMES: dict[str, str] = {
+    PUMP_PROGRAM_ID: "pump_direct",
+    "MAyhSmzXzV1pTf7LsNkrNwkWKTo4ougAJ1PPg47MD4e": "mayhem",        # pump.fun native
+    "MaestroAAe9ge5HTc64VbBQZ6fP77pwvrhM8i1XWSAx": "maestro",       # telegram bot
+    "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4": "jupiter",       # aggregator
+    "FLASHX8DrLbgeR8FcfNV1F5krxYcYMUdBkrP1EPBtxB9": "flashx",       # unidentified wrapper
+}
+
+
+def entry_program(logs: list[str]) -> str | None:
+    """The first non-infra program invoked at the top level [1] — the program
+    that actually drives the trade (pump itself for a direct call, else the
+    wrapping router/aggregator/bot). Parsed from logs, zero RPC. None if no
+    top-level program line is present. Stored raw so categorisation stays a
+    revisable mapping (see ``route_category``) rather than baked at capture."""
+    for line in logs:
+        if line.startswith("Program ") and " invoke [1]" in line:
+            prog = line.split()[1]
+            if prog not in _INFRA_PROGRAMS:
+                return prog
+    return None
+
+
+def route_category(prog: str | None) -> str:
+    """Map a stored entry program to a readable route name for analysis/retrain.
+    Unknown programs -> 'other'; None -> 'unknown'."""
+    if prog is None:
+        return "unknown"
+    return _ROUTE_NAMES.get(prog, "other")
+
+
 @dataclass
 class Reserves:
     """Decoded bonding-curve reserves, in SOL (not lamports)."""
@@ -712,6 +768,13 @@ class PumpLogsFeed:
                                     # No routing info in the event; use the size
                                     # heuristic (same rule as the no-RPC fallback).
                                     via_frontend=te.sol_amount >= _HUMAN_SOL_THRESHOLD,
+                                    # Direct-call bot flag, parsed from the logs we
+                                    # already have (0 RPC). Captured for a future
+                                    # model feature; doesn't affect via_frontend.
+                                    is_direct=is_direct_pump_call(logs),
+                                    # Raw entry program (router/bot/pump) for
+                                    # per-route signal at the next retrain; 0 RPC.
+                                    entry_program=entry_program(logs),
                                 )
                                 yield ("swap", swap, te.mint, signature)
                                 continue
