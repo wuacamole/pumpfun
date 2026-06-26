@@ -50,8 +50,15 @@ CREATE TABLE IF NOT EXISTS swaps (
     source      TEXT    NOT NULL DEFAULT 'pumpportal',  -- feed provenance
     ingested_at REAL    NOT NULL
 );
-CREATE INDEX IF NOT EXISTS ix_swaps_mint ON swaps(mint);
-CREATE INDEX IF NOT EXISTS ix_swaps_ts   ON swaps(ts);
+-- Composite (mint, ts) is the hot path: swaps_for / the backtest / live
+-- scoring all filter by mint then read in ts order. A single covering index
+-- lets SQLite seek the mint and walk it pre-sorted instead of scanning the
+-- mint index, scanning the ts index, and merging. ix_swaps_ts is kept for the
+-- retention/prune scan (WHERE ts < cutoff across all mints); ix_swaps_mint is
+-- redundant given the composite (its leftmost column is mint) and is dropped.
+CREATE INDEX IF NOT EXISTS ix_swaps_mint_ts ON swaps(mint, ts);
+CREATE INDEX IF NOT EXISTS ix_swaps_ts      ON swaps(ts);
+DROP INDEX IF EXISTS ix_swaps_mint;
 """
 
 SCHEMA_TOKENS = """
@@ -169,6 +176,21 @@ class Store:
         self.conn.executescript(SCHEMA_SWAPS)
         self.conn.executescript(SCHEMA_TOKENS)
         self.conn.executescript(SCHEMA_PAPER)
+        # Truncate the WAL on open. Without an explicit checkpoint the WAL grows
+        # unbounded under a long-lived writer (SQLite only auto-checkpoints when
+        # the WAL crosses wal_autocheckpoint pages, and never truncates the file
+        # back down), so a multi-day live_monitor leaves a multi-GB -wal behind.
+        # Startup is the natural point: no readers are mid-query yet.
+        self.checkpoint()
+
+    def checkpoint(self) -> None:
+        """Flush the WAL into the main db and truncate it back to zero.
+
+        Safe to call any time; TRUNCATE blocks only if a reader is mid-read on
+        an old snapshot. Call periodically (startup, and e.g. after each daily
+        export) to keep ``pumpfun.db-wal`` from growing without bound.
+        """
+        self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
 
     # ------------------------------------------------------------------ swaps
     def log_swap(
@@ -244,6 +266,23 @@ class Store:
             self.conn.execute("ROLLBACK")
             raise
 
+    def _recompute_n_swaps(self) -> None:
+        """Re-derive ``tokens.n_swaps`` from the actual swap rows.
+
+        ``n_swaps`` is a denormalized counter maintained incrementally in
+        :meth:`_log_swap_inner`. Any path that *removes* rows from ``swaps``
+        (dedupe, retention pruning, or a manual DELETE) desyncs it, which then
+        skews every per-swap feature in the training set. Every delete path must
+        call this so the counter stays the single derived truth. It's a full
+        re-count, so it's O(rows) — cheap relative to the delete that triggered
+        it, and only run on maintenance paths, never on the hot insert path.
+        """
+        self.conn.execute(
+            """UPDATE tokens SET n_swaps = (
+                 SELECT COUNT(*) FROM swaps WHERE swaps.mint = tokens.mint
+               )"""
+        )
+
     def dedupe_swaps(self) -> int:
         """Remove duplicate swap rows (same mint, ts, wallet, is_buy, sol_amount,
         vsol_after). Returns the number of rows deleted.
@@ -254,6 +293,14 @@ class Store:
         — a correctness bug for the training set. Run this periodically (e.g. on
         startup) to keep the record honest. The first occurrence (lowest rowid)
         is kept; later duplicates are deleted.
+
+        The key deliberately includes ``vsol_after``: two *genuinely distinct*
+        trades by the same wallet at the same ``ts`` for the same ``sol_amount``
+        still move the bonding curve, so their ``vsol_after`` differs and they
+        are not collapsed. Only byte-identical event rows (i.e. a true replay of
+        the same on-chain event) share all six columns. ``id``/``ingested_at``
+        are excluded on purpose — they differ across replays of the same event,
+        so including them would defeat the dedupe.
         """
         cur = self.conn.execute(
             """DELETE FROM swaps WHERE id NOT IN (
@@ -263,12 +310,26 @@ class Store:
         )
         deleted = cur.rowcount or 0
         if deleted:
-            # Recompute n_swaps per token to match the deduped swaps table.
-            self.conn.execute(
-                """UPDATE tokens SET n_swaps = (
-                     SELECT COUNT(*) FROM swaps WHERE swaps.mint = tokens.mint
-                   )"""
-            )
+            self._recompute_n_swaps()
+        return deleted
+
+    def prune_swaps_before(self, cutoff_ts: float) -> int:
+        """Delete swaps with ``ts < cutoff_ts`` and re-derive ``n_swaps``.
+
+        The ``swaps`` table is append-only and grows without bound; past ~10M
+        rows the Parquet export and every ``swaps_for`` scan slow down. Keep a
+        rolling window in SQLite (the live/training-hot data) and let the older
+        rows live only in the immutable Parquet snapshots, which are the
+        analytical source anyway. **Export a snapshot covering the window first**
+        (:meth:`export_parquet`) — pruning is destructive to SQLite. Returns the
+        number of rows deleted; runs the WAL checkpoint so the freed pages don't
+        sit in an ever-growing WAL after a large delete.
+        """
+        cur = self.conn.execute("DELETE FROM swaps WHERE ts < ?", (cutoff_ts,))
+        deleted = cur.rowcount or 0
+        if deleted:
+            self._recompute_n_swaps()
+            self.checkpoint()
         return deleted
 
     # --------------------------------------------------------------- tokens

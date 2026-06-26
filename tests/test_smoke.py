@@ -734,6 +734,44 @@ def test_store_log_swaps_batch():
     os.unlink(db_path)
 
 
+def test_store_dedupe_keeps_distinct_same_ts_swaps(tmp_path):
+    """Two genuine same-wallet/same-ts/same-size trades differ in vsol_after
+    (each moves the curve), so dedupe must NOT collapse them."""
+    s = Store(tmp_path / "d.db")
+    mint = "DistinctMint"
+    s.log_swap(_swap(0, 1.0, "w", True, 1.0, 31.0), mint)
+    s.log_swap(_swap(0, 1.0, "w", True, 1.0, 32.0), mint)  # same ts, different vsol_after
+    assert s.dedupe_swaps() == 0
+    assert s.get_token(mint).n_swaps == 2
+    s.close()
+
+
+def test_store_prune_swaps_before(tmp_path):
+    """prune_swaps_before drops old rows and re-derives n_swaps."""
+    s = Store(tmp_path / "p.db")
+    mint = "PruneMint"
+    for i in range(5):
+        s.log_swap(_swap(i, float(i), f"w{i}", True, 1.0, 31.0 + i), mint)
+    assert s.get_token(mint).n_swaps == 5
+    deleted = s.prune_swaps_before(3.0)  # ts 0,1,2 dropped; 3,4 kept
+    assert deleted == 3
+    assert len(s.swaps_for(mint)) == 2
+    assert s.get_token(mint).n_swaps == 2
+    s.close()
+
+
+def test_store_swaps_composite_index(tmp_path):
+    """The (mint, ts) composite index exists and the redundant single-column
+    mint index has been dropped."""
+    s = Store(tmp_path / "ix.db")
+    names = {r[0] for r in s.conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='swaps'"
+    )}
+    assert "ix_swaps_mint_ts" in names
+    assert "ix_swaps_mint" not in names
+    s.close()
+
+
 def test_store_graduation_price_roundtrip(tmp_path):
     """record/get graduation price roundtrips."""
     db = tmp_path / "gp.db"
