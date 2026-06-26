@@ -117,7 +117,13 @@ class TokenScore:
 def _breakeven_probability(vsol: float) -> float:
     """The minimum graduation probability a buy-and-hold entry needs to be +EV.
     Straight from the paper: p > (vSol / 115)^2."""
-    return min((vsol / _graduation_vsol()) ** 2, 1.0)
+    # Floor the progress ratio at 0: bonding progress is physically non-negative
+    # (virtual reserves only grow), but the reconstructed-vSol fallback can drift
+    # negative on a large sell. A negative ratio would give a spuriously positive
+    # breakeven here and a *complex* result under the fractional power in
+    # _estimate_graduation_prob — guard at every base-of-a-power use.
+    progress = max(vsol / _graduation_vsol(), 0.0)
+    return min(progress ** 2, 1.0)
 
 
 def _estimate_graduation_prob(
@@ -140,7 +146,10 @@ def _estimate_graduation_prob(
       - HIGH conviction (sol per human wallet, big net trades) pushes it UP
       - momentum matters: successful tokens move fast (median 4.4 min)
     """
-    base = (vsol / _graduation_vsol()) ** 1.6      # below the breakeven parabola on its own
+    # Floor at 0 before the fractional power: a negative base under ** 1.6
+    # returns a Python complex, which then crashes the final clamp. See
+    # _breakeven_probability for why vsol can transiently go negative.
+    base = max(vsol / _graduation_vsol(), 0.0) ** 1.6   # below the breakeven parabola on its own
 
     # Conviction lift: this is what moves the curve ABOVE breakeven.
     conviction = math.tanh(sol_per_human_wallet / 0.5)      # ~0.5 SOL/human wallet saturates
