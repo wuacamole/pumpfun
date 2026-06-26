@@ -366,13 +366,19 @@ async def run(
         pc = get_cached_constants()
         print(f"protocol constants (cached fallback): v_sol_graduation={pc.v_sol_graduation:.2f}")
 
-    # Charter I5: warn if the fee schedule is stale (a regime change may have
-    # happened since the last entry in _REGIMES). Backtests across a fee-regime
-    # change use the wrong schedule if this isn't updated.
-    from config import warn_if_stale_regime
-    stale = warn_if_stale_regime()
-    if stale:
-        print(stale)
+    # Charter I5: compare on-chain fees to _REGIMES and warn on mismatch.
+    # check_live_fee_regime reuses the already-fetched pc to avoid a second
+    # RPC call; it's non-blocking (returns None on any error).
+    if rpc_url:
+        from config import check_live_fee_regime
+        fee_warn = await check_live_fee_regime(rpc_url, pump_constants=pc)
+        if fee_warn:
+            print(fee_warn)
+    else:
+        from config import warn_if_stale_regime
+        stale = warn_if_stale_regime()
+        if stale:
+            print(stale)
 
     broker = PaperBroker() if paper else None
     if broker is not None:

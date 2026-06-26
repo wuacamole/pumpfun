@@ -122,7 +122,7 @@ _REGIMES: list[tuple[float, FeeSchedule]] = [
         slippage=0.02, mev_penalty=0.01,
     )),
     # 2026-05-21 00:00 UTC — USDC pairing launch + revised creator fee.
-    (1_768_044_800, FeeSchedule(
+    (1_779_321_600, FeeSchedule(
         protocol_bps=95, creator_bps=5, pumpswap_lp_bps=20, pumpswap_protocol_bps=5,
         slippage=0.02, mev_penalty=0.01,
     )),
@@ -389,3 +389,183 @@ async def load_protocol_constants(rpc_url: str) -> ProtocolConstants:
             return pc
     except Exception:
         return get_cached_constants()
+
+
+# ---------------------------------------------------------------------------
+# Live fee-regime checker
+# ---------------------------------------------------------------------------
+
+def _decode_pumpswap_config(raw: bytes) -> tuple[int, int] | None:
+    """Decode PumpSwap GlobalConfig bytes → (lp_fee_bps, protocol_fee_bps).
+
+    Inferred Anchor layout:
+      discriminator(8) + admin(Pubkey,32) +
+      lp_fee_basis_points(u64) + protocol_fee_basis_points(u64) + …
+
+    Returns None if bytes are too short or values fail sanity range checks
+    (0–500 bps each), so a wrong layout produces None rather than garbage.
+    """
+    if len(raw) < 56:  # 8 + 32 + 8 + 8
+        return None
+    try:
+        lp_fee = struct.unpack_from("<Q", raw, 40)[0]
+        proto_fee = struct.unpack_from("<Q", raw, 48)[0]
+        if not (0 <= lp_fee <= 500 and 0 <= proto_fee <= 500):
+            return None
+        return int(lp_fee), int(proto_fee)
+    except Exception:
+        return None
+
+
+def _append_regime_entry_to_file(ts: float, sched: FeeSchedule) -> bool:
+    """Insert a new _REGIMES entry into config.py on disk.
+
+    Locates the closing ] of the _REGIMES list by finding the rightmost
+    "    )),\\n]" in the file (unique in config.py) and inserts the new
+    entry immediately before it. Returns True on success.
+    """
+    import datetime as _dt
+    import pathlib as _pl
+
+    config_path = _pl.Path(__file__).with_name("config.py")
+    try:
+        text = config_path.read_text()
+        ts_int = int(ts)
+        dt_str = _dt.datetime.fromtimestamp(ts, tz=_dt.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        new_entry = (
+            f"    # {dt_str} — on-chain fee change detected;"
+            f" slippage/mev carried from prior entry.\n"
+            f"    ({ts_int:_}, FeeSchedule(\n"
+            f"        protocol_bps={sched.protocol_bps}, creator_bps={sched.creator_bps},"
+            f" pumpswap_lp_bps={sched.pumpswap_lp_bps},"
+            f" pumpswap_protocol_bps={sched.pumpswap_protocol_bps},\n"
+            f"        slippage={sched.slippage}, mev_penalty={sched.mev_penalty},\n"
+            f"    )),\n"
+        )
+        marker = "    )),\n]"
+        idx = text.rfind(marker)
+        if idx < 0:
+            return False
+        insert_pos = idx + len("    )),\n")
+        config_path.write_text(text[:insert_pos] + new_entry + text[insert_pos:])
+        return True
+    except Exception:
+        return False
+
+
+async def check_live_fee_regime(
+    rpc_url: str,
+    *,
+    pump_constants: ProtocolConstants | None = None,
+    auto_append: bool = False,
+    effective_from: float | None = None,
+) -> str | None:
+    """Compare on-chain fees to the latest _REGIMES entry; warn on mismatch.
+
+    Reads the Pump Global account and (optionally) the PumpSwap GlobalConfig
+    from ``rpc_url`` and compares live fee values to ``_REGIMES[-1]``. Returns
+    a warning string on mismatch, None if fees agree or the check itself fails
+    (errors are non-blocking — startup must never hang on this).
+
+    pump_constants: pass the already-fetched ProtocolConstants from
+        load_protocol_constants() to avoid a redundant RPC round-trip.
+
+    auto_append: if True and fees differ, appends a new FeeSchedule to
+        _REGIMES in memory *and* writes config.py on disk. Set effective_from
+        to the actual on-chain change date before backtesting across the
+        boundary; if omitted it defaults to time.time().
+    """
+    import time as _time
+    import httpx
+
+    # Reuse already-fetched pump constants if provided; otherwise re-fetch.
+    pc = pump_constants
+    swap_raw: bytes | None = None
+
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            if pc is None:
+                r = await client.post(
+                    rpc_url,
+                    json={
+                        "jsonrpc": "2.0", "id": 1, "method": "getAccountInfo",
+                        "params": [PUMP_GLOBAL_ACCOUNT, {"encoding": "base64", "commitment": "confirmed"}],
+                    },
+                )
+                v = r.json()["result"]["value"]
+                if v is None:
+                    return None
+                raw = base64.b64decode(v["data"][0] if isinstance(v["data"], list) else v["data"])
+                pc = decode_global_account(raw)
+
+            r2 = await client.post(
+                rpc_url,
+                json={
+                    "jsonrpc": "2.0", "id": 2, "method": "getAccountInfo",
+                    "params": [PUMP_SWAP_GLOBAL_CONFIG, {"encoding": "base64", "commitment": "confirmed"}],
+                },
+            )
+            v2 = r2.json()["result"]["value"]
+            if v2 is not None:
+                raw2 = v2["data"][0] if isinstance(v2["data"], list) else v2["data"]
+                swap_raw = base64.b64decode(raw2)
+    except Exception:
+        return None  # non-blocking — don't surface RPC errors at startup
+
+    _, latest = _REGIMES[-1]
+
+    pump_mismatch = (
+        pc.fee_basis_points != latest.protocol_bps
+        or pc.creator_fee != latest.creator_bps
+    )
+    swap_lp_bps: int | None = None
+    swap_proto_bps: int | None = None
+    if swap_raw is not None:
+        decoded = _decode_pumpswap_config(swap_raw)
+        if decoded is not None:
+            swap_lp_bps, swap_proto_bps = decoded
+    swap_mismatch = swap_lp_bps is not None and (
+        swap_lp_bps != latest.pumpswap_lp_bps
+        or swap_proto_bps != latest.pumpswap_protocol_bps
+    )
+
+    if not pump_mismatch and not swap_mismatch:
+        return None
+
+    parts: list[str] = []
+    if pump_mismatch:
+        parts.append(
+            f"pump: on-chain {pc.fee_basis_points}+{pc.creator_fee} bps, "
+            f"_REGIMES has {latest.protocol_bps}+{latest.creator_bps} bps"
+        )
+    if swap_mismatch:
+        parts.append(
+            f"pumpswap: on-chain {swap_lp_bps}+{swap_proto_bps} bps, "
+            f"_REGIMES has {latest.pumpswap_lp_bps}+{latest.pumpswap_protocol_bps} bps"
+        )
+    diff = "; ".join(parts)
+
+    if not auto_append:
+        return (
+            f"WARNING: on-chain fees differ from latest _REGIMES entry: {diff}. "
+            f"Append a new (ts, FeeSchedule(...)) to _REGIMES in config.py."
+        )
+
+    eff_ts = effective_from if effective_from is not None else _time.time()
+    new_sched = FeeSchedule(
+        protocol_bps=pc.fee_basis_points,
+        creator_bps=pc.creator_fee,
+        pumpswap_lp_bps=swap_lp_bps if swap_lp_bps is not None else latest.pumpswap_lp_bps,
+        pumpswap_protocol_bps=swap_proto_bps if swap_proto_bps is not None else latest.pumpswap_protocol_bps,
+        slippage=latest.slippage,
+        mev_penalty=latest.mev_penalty,
+    )
+    _REGIMES.append((eff_ts, new_sched))
+    persisted = _append_regime_entry_to_file(eff_ts, new_sched)
+
+    return (
+        f"NOTICE: on-chain fees differ ({diff}); auto-appended new regime "
+        f"effective_from={int(eff_ts)} "
+        f"({'written to config.py' if persisted else 'config.py write failed — add manually'}). "
+        f"Correct effective_from to the actual on-chain change date before backtesting across the boundary."
+    )
