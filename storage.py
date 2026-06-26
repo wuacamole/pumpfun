@@ -144,6 +144,24 @@ CREATE TABLE IF NOT EXISTS graduation_prices (
 # Outcome vocabulary. ``unknown`` means we haven't classified it yet.
 OUTCOMES = {"graduated", "stalled", "rugged", "unknown"}
 
+# Parquet schema for the swaps snapshot. Pulled out of export_parquet so the
+# streaming writer and any future reader agree on one definition.
+_SWAPS_PARQUET_SCHEMA = pa.schema([
+    ("mint", pa.string()),
+    ("ts", pa.float64()),
+    ("wallet", pa.string()),
+    ("is_buy", pa.bool_()),
+    ("sol_amount", pa.float64()),
+    ("vsol_after", pa.float64()),
+    ("via_frontend", pa.bool_()),
+    ("source", pa.string()),
+    ("ingested_at", pa.float64()),
+])
+
+# Rows pulled from SQLite per batch when streaming the swaps snapshot. Bounds
+# peak memory to one batch instead of the whole table; ~50k rows is a few MB.
+_PARQUET_EXPORT_BATCH = 50_000
+
 
 @dataclass
 class TokenRow:
@@ -428,49 +446,63 @@ class Store:
         ]
 
     # ------------------------------------------------------------ parquet
+    def _write_swaps_parquet(self, path: Path) -> None:
+        """Stream the ``swaps`` table to a Parquet file in bounded batches.
+
+        ``swaps`` is the only unbounded table; ``fetchall`` + a single
+        ``from_pylist`` would hold the whole table (twice) in RAM, which is the
+        export bottleneck past a few million rows. We page through it with a
+        server-side cursor and write one row group per batch, so peak memory is
+        ``_PARQUET_EXPORT_BATCH`` rows regardless of table size. The writer
+        emits a valid (empty) file even when there are no rows.
+        """
+        cur = self.conn.execute(
+            "SELECT mint, ts, wallet, is_buy, sol_amount, vsol_after, via_frontend, "
+            "source, ingested_at FROM swaps"
+        )
+        writer = pq.ParquetWriter(str(path), _SWAPS_PARQUET_SCHEMA)  # type: ignore[no-untyped-call]
+        try:
+            while True:
+                rows = cur.fetchmany(_PARQUET_EXPORT_BATCH)
+                if not rows:
+                    break
+                batch = pa.Table.from_pylist(
+                    [
+                        {
+                            "mint": r["mint"],
+                            "ts": r["ts"],
+                            "wallet": r["wallet"],
+                            "is_buy": bool(r["is_buy"]),
+                            "sol_amount": r["sol_amount"],
+                            "vsol_after": r["vsol_after"],
+                            "via_frontend": bool(r["via_frontend"]),
+                            "source": r["source"],
+                            "ingested_at": r["ingested_at"],
+                        }
+                        for r in rows
+                    ],
+                    schema=_SWAPS_PARQUET_SCHEMA,
+                )
+                writer.write_table(batch)  # type: ignore[no-untyped-call]
+        finally:
+            writer.close()  # type: ignore[no-untyped-call]
+
     def export_parquet(self, out_dir: str | Path = "snapshots") -> Path:
         """Snapshot the whole store to Parquet. Returns the snapshot path.
 
         Two files: ``swaps_<ts>.parquet`` and ``tokens_<ts>.parquet``.
-        These are what :mod:`model` and :mod:`backtest` read from.
+        These are what :mod:`model` and :mod:`backtest` read from. The swaps
+        table is streamed in batches (see :meth:`_write_swaps_parquet`); the
+        bounded tables fit in memory.
         """
         out_dir = Path(out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
         ts = int(time.time())
 
-        swap_rows = self.conn.execute(
-            "SELECT mint, ts, wallet, is_buy, sol_amount, vsol_after, via_frontend, "
-            "source, ingested_at FROM swaps"
-        ).fetchall()
-        token_rows = self.conn.execute("SELECT * FROM tokens").fetchall()
+        s_path = out_dir / f"swaps_{ts}.parquet"
+        self._write_swaps_parquet(s_path)
 
-        swaps_table = pa.Table.from_pylist(
-            [
-                {
-                    "mint": r["mint"],
-                    "ts": r["ts"],
-                    "wallet": r["wallet"],
-                    "is_buy": bool(r["is_buy"]),
-                    "sol_amount": r["sol_amount"],
-                    "vsol_after": r["vsol_after"],
-                    "via_frontend": bool(r["via_frontend"]),
-                    "source": r["source"],
-                    "ingested_at": r["ingested_at"],
-                }
-                for r in swap_rows
-            ],
-            schema=pa.schema([
-                ("mint", pa.string()),
-                ("ts", pa.float64()),
-                ("wallet", pa.string()),
-                ("is_buy", pa.bool_()),
-                ("sol_amount", pa.float64()),
-                ("vsol_after", pa.float64()),
-                ("via_frontend", pa.bool_()),
-                ("source", pa.string()),
-                ("ingested_at", pa.float64()),
-            ]),
-        )
+        token_rows = self.conn.execute("SELECT * FROM tokens").fetchall()
         tokens_table = pa.Table.from_pylist(
             [
                 {
@@ -501,10 +533,8 @@ class Store:
             ]),
         )
 
-        s_path = out_dir / f"swaps_{ts}.parquet"
         t_path = out_dir / f"tokens_{ts}.parquet"
         g_path = out_dir / f"graduation_prices_{ts}.parquet"
-        pq.write_table(swaps_table, s_path)  # type: ignore[no-untyped-call]
         pq.write_table(tokens_table, t_path)  # type: ignore[no-untyped-call]
 
         # Graduation prices (post-graduation PumpSwap first-trade price).

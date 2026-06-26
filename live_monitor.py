@@ -88,6 +88,11 @@ MAX_SUBSCRIPTIONS = 200
 # are evicted by _gc(force=True) so the buffer can't grow unbounded under load
 # (a memory leak that drops the feed is a correctness bug, not just speed).
 MAX_TOKENS = 1000
+# How often to flush+truncate the SQLite WAL during a long run. The WAL is only
+# truncated on Store open; a monitor that runs for days never reopens, so the
+# WAL grows between restarts. Checkpoint on this cadence to keep it bounded.
+# Gated behind swap activity (only writes grow the WAL), so it's a no-op when idle.
+WAL_CHECKPOINT_EVERY_SEC = 6 * 3600
 
 
 def _approx_via_frontend(evt: dict[str, Any]) -> bool:
@@ -407,6 +412,7 @@ async def run(
         n_swaps_total = 0
         last_swaps_window = 0
         last_stats_ts = time.time()
+        last_checkpoint_ts = time.time()
     stats = _Stats()
 
     def _vsol_for(mint: str, sw: Swap) -> float:
@@ -486,6 +492,11 @@ async def run(
             )
             stats.last_swaps_window = stats.n_swaps_total
             stats.last_stats_ts = now
+
+        # Keep the WAL bounded on a long run (Store only truncates it on open).
+        if now - stats.last_checkpoint_ts >= WAL_CHECKPOINT_EVERY_SEC:
+            store.checkpoint()
+            stats.last_checkpoint_ts = now
 
         _maybe_score(mint, now, store, fitted, broker, alert, dash, dashboard)
 

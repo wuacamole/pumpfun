@@ -760,6 +760,34 @@ def test_store_prune_swaps_before(tmp_path):
     s.close()
 
 
+def test_store_export_parquet_streams_multiple_batches(tmp_path, monkeypatch):
+    """Streaming export writes every row even when the table spans several
+    batches (batch size forced small), and round-trips faithfully."""
+    import storage as storage_mod
+    monkeypatch.setattr(storage_mod, "_PARQUET_EXPORT_BATCH", 7)
+    s = Store(tmp_path / "stream.db")
+    mint = "StreamMint"
+    swaps = [_swap(i, float(i), f"w{i}", i % 2 == 0, 1.0 + i, 31.0 + i) for i in range(20)]
+    s.log_swaps(mint, swaps)
+    s.export_parquet(tmp_path / "snaps")
+    sp, _tp, _gp = load_latest_snapshot(tmp_path / "snaps")
+    import pyarrow.parquet as pq
+    t = pq.read_table(sp)
+    assert t.num_rows == 20  # 20 rows across batches of 7
+    assert set(t.column("ts").to_pylist()) == {float(i) for i in range(20)}
+    s.close()
+
+
+def test_store_export_parquet_empty(tmp_path):
+    """An empty swaps table still produces a valid, readable parquet file."""
+    s = Store(tmp_path / "empty.db")
+    s.export_parquet(tmp_path / "snaps")
+    sp, _tp, _gp = load_latest_snapshot(tmp_path / "snaps")
+    import pyarrow.parquet as pq
+    assert pq.read_table(sp).num_rows == 0
+    s.close()
+
+
 def test_store_swaps_composite_index(tmp_path):
     """The (mint, ts) composite index exists and the redundant single-column
     mint index has been dropped."""
