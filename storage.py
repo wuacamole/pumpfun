@@ -52,6 +52,9 @@ CREATE TABLE IF NOT EXISTS swaps (
                                              -- NULL = unknown (no logs: PumpPortal/RPC path).
                                              -- Captured from logs (0 RPC); a candidate model
                                              -- feature once enough labelled data accumulates.
+    entry_program TEXT,                        -- raw top-level program driving the trade
+                                             -- (pump=direct, else router/bot); NULL if unknown.
+                                             -- Categorise at retrain via helius.route_category.
     source      TEXT    NOT NULL DEFAULT 'pumpportal',  -- feed provenance
     ingested_at REAL    NOT NULL
 );
@@ -213,6 +216,8 @@ class Store:
         cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(swaps)")}
         if "is_direct" not in cols:
             self.conn.execute("ALTER TABLE swaps ADD COLUMN is_direct INTEGER")
+        if "entry_program" not in cols:
+            self.conn.execute("ALTER TABLE swaps ADD COLUMN entry_program TEXT")
 
     def checkpoint(self) -> None:
         """Flush the WAL into the main db and truncate it back to zero.
@@ -259,8 +264,8 @@ class Store:
         self.conn.execute(
             """INSERT INTO swaps
                  (mint, ts, wallet, is_buy, sol_amount, vsol_after, via_frontend,
-                  is_direct, source, ingested_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                  is_direct, entry_program, source, ingested_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 mint,
                 swap.ts,
@@ -270,6 +275,7 @@ class Store:
                 swap.vsol_after,
                 1 if swap.via_frontend else 0,
                 None if is_direct is None else (1 if is_direct else 0),
+                getattr(swap, "entry_program", None),
                 source,
                 ingested_at if ingested_at is not None else time.time(),
             ),

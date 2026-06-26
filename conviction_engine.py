@@ -98,6 +98,10 @@ class Swap:
     # distinct from the size-heuristic ``via_frontend`` so the working model is
     # unaffected until we deliberately retrain.
     is_direct: bool | None = None
+    # Raw top-level program that drove the trade (pump itself for a direct call,
+    # else the wrapping router/aggregator/telegram-bot). Stored raw so route
+    # categorisation stays revisable; None when unknown (no logs). Zero RPC.
+    entry_program: str | None = None
 
 
 @dataclass(frozen=True)
