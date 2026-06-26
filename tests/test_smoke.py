@@ -291,6 +291,18 @@ def test_engine_still_separates():
     assert conv_score.edge > churn_score.edge
 
 
+def test_grad_prob_handles_negative_vsol():
+    """Regression: a negative vsol (reconstructed-vSol fallback drifting below
+    zero on a large sell) raised a fractional power to a complex number and
+    crashed the clamp with 'float < complex'. Both probability helpers must
+    stay real and in [0, 1]."""
+    from conviction_engine import _breakeven_probability, _estimate_graduation_prob
+    p = _estimate_graduation_prob(-5.0, 0.2, 0.3, 0.1, 120.0)
+    b = _breakeven_probability(-5.0)
+    assert isinstance(p, float) and 0.0 <= p <= 1.0
+    assert isinstance(b, float) and 0.0 <= b <= 1.0
+
+
 # ---- helius helpers ----------------------------------------------------------
 
 def test_collect_instructions():

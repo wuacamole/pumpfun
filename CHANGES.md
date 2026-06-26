@@ -127,6 +127,7 @@ All notable changes to the pumpfun conviction scoring system.
 | 8 | HIGH | `backtest.py` | `json.dumps` invalid JSON for NaN — `_safe()` helper |
 | 9 | MEDIUM | `conviction_engine.py` | `score_token` missing seconds clamp — added `max(seconds, 1e-6)` |
 | 10 | MEDIUM | `backtest.py` | First-fold heuristic `n_human=1` diverged from `featurize` — uses `0.0` fallback |
+| 11 | CRITICAL | `conviction_engine.py` | Negative `vsol` (reconstructed-vSol fallback drifting below 0 on a large sell) raised to the fractional power `** 1.6` produced a Python `complex`, crashing the probability clamp with `'<' not supported between 'float' and 'complex'` and killing the live monitor. Floor the bonding-progress ratio at 0 before every power in `_breakeven_probability` / `_estimate_graduation_prob`. |
 
 ### Removed
 
