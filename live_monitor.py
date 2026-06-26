@@ -898,6 +898,33 @@ def _rescore_with_model(s: TokenScore, est: float, edge: float) -> TokenScore:
     )
 
 
+def _acquire_singleton_lock(db_path: str):
+    """Refuse to start if another monitor is already running for this DB.
+
+    Two concurrent monitors each subscribe to the feed and log every trade, so the
+    swaps table gets ~50% duplicate rows (different receipt ts, same on-chain
+    trade), corrupting every per-token feature. An exclusive, non-blocking flock
+    held for the process lifetime guarantees exactly one writer regardless of how
+    the process is launched (the harness can double-spawn a backgrounded command).
+    Returns the held fd (keep it alive); exits the process if the lock is taken.
+    """
+    import fcntl
+    import hashlib
+    import sys
+    key = hashlib.md5(os.path.abspath(db_path).encode()).hexdigest()[:12]
+    lock_path = f"/tmp/pumpfun_monitor_{key}.lock"
+    fd = open(lock_path, "w")
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print(f"another live_monitor is already running for {db_path}; exiting",
+              file=sys.stderr, flush=True)
+        sys.exit(0)
+    fd.write(str(os.getpid()))
+    fd.flush()
+    return fd
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Pump.fun conviction live monitor")
     ap.add_argument("--paper", action="store_true", help="paper-trade ENTER signals")
@@ -905,6 +932,8 @@ def main() -> None:
     ap.add_argument("--db", default=os.environ.get("PUMPFUN_DB", "pumpfun.db"))
     ap.add_argument("--model", default="latest", help="fitted model name (models/<name>.pkl)")
     args = ap.parse_args()
+    # Singleton guard: prevents the duplicate-writer corruption described above.
+    _singleton_fd = _acquire_singleton_lock(args.db)  # noqa: F841 - held for lifetime
     try:
         asyncio.run(run(paper=args.paper, dashboard=args.dashboard, db_path=args.db, model_name=args.model))
     except KeyboardInterrupt:
