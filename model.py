@@ -45,8 +45,16 @@ from __future__ import annotations
 import json
 import pickle
 import time
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
+
+# The creator/holder features (creator_graduated_count, top_holder_share, …) are
+# intentionally all-NaN until the join data exists; SimpleImputer warns once per
+# predict, which floods the live monitor log. Silence that specific message only.
+warnings.filterwarnings(
+    "ignore", message="Skipping features without any observed values"
+)
 
 import numpy as np
 import pandas as pd

@@ -525,6 +525,53 @@ def test_decode_bonding_curve_no_quote_mint():
     assert bc.is_sol_paired is True
 
 
+def _trade_event_log(sol_lamports=1_500_000_000, is_buy=1, v_sol=30 * 10**9,
+                     r_sol=5 * 10**9, cpi=False):
+    """Build a synthetic pump.fun TradeEvent 'Program data:' log line."""
+    import base64
+    import struct
+
+    from solders.pubkey import Pubkey
+
+    from helius import _ANCHOR_CPI_EVENT_SENTINEL, TRADE_EVENT_DISCRIMINATOR
+    mint = bytes(Pubkey.default())
+    user = bytes(Pubkey.default())
+    body = (mint + struct.pack("<QQ", sol_lamports, 42_000) + bytes([is_buy]) + user
+            + struct.pack("<q", 1_750_000_000)
+            + struct.pack("<4Q", v_sol, 1_000_000, r_sol, 800_000))
+    payload = TRADE_EVENT_DISCRIMINATOR + body
+    if cpi:
+        payload = _ANCHOR_CPI_EVENT_SENTINEL + payload
+    return "Program data: " + base64.b64encode(payload).decode()
+
+
+def test_decode_trade_event_roundtrip():
+    """A trade is decoded from the log with true reserves and no RPC."""
+    from helius import decode_trade_event
+    te = decode_trade_event(["Program log: Instruction: Buy", _trade_event_log()])
+    assert te is not None
+    assert te.is_buy is True
+    assert abs(te.sol_amount - 1.5) < 1e-9
+    assert abs(te.vsol_after - 35.0) < 1e-9  # (v_sol + r_sol) in SOL
+
+
+def test_decode_trade_event_cpi_framing():
+    """emit_cpi! sentinel-wrapped events decode identically."""
+    from helius import decode_trade_event
+    te = decode_trade_event([_trade_event_log(cpi=True)])
+    assert te is not None and abs(te.vsol_after - 35.0) < 1e-9
+
+
+def test_decode_trade_event_rejects_noise():
+    """Non-trade logs decode to None so the caller falls back to the RPC path."""
+    import base64
+
+    from helius import decode_trade_event
+    junk = "Program data: " + base64.b64encode(b"not a trade event").decode()
+    assert decode_trade_event(["Program log: hello", junk]) is None
+    assert decode_trade_event([]) is None
+
+
 # ---- PaperBroker.check_exits ------------------------------------------------
 
 def test_paper_broker_time_stop():
@@ -824,3 +871,95 @@ def test_store_graduation_price_roundtrip(tmp_path):
     all_gp = s.all_graduation_prices()
     assert "MintX" in all_gp
     s.close()
+
+
+def test_curve_price_per_token_monotonic():
+    """curve_price_per_token follows the constant-product curve: price rises with
+    vSol as V**2, and the terminal price matches the known ~4.1e-7 SOL/token."""
+    from config import curve_price_per_token, get_cached_constants
+
+    pc = get_cached_constants()
+    # Doubling vSol quadruples the price (V**2 law).
+    assert curve_price_per_token(60, pc) == pytest.approx(4 * curve_price_per_token(30, pc))
+    # Terminal price at graduation vSol.
+    assert curve_price_per_token(pc.v_sol_graduation, pc) == pytest.approx(4.108e-7, rel=1e-3)
+    # Degenerate inputs are safe.
+    assert curve_price_per_token(0, pc) == 0.0
+    assert curve_price_per_token(-5, pc) == 0.0
+
+
+def test_graduation_payoff_per_position():
+    """Per-position payoff (charter I2): exit at the real PumpSwap price over the
+    bonding-curve entry price. Entering early (low vSol) yields a higher multiple
+    than entering at graduation. Regression: payoff_multiple used to be NULL, and
+    the first fix wrongly used the graduation vSol as the entry baseline."""
+    from config import curve_price_per_token, get_cached_constants
+
+    pc = get_cached_constants()
+    terminal = curve_price_per_token(pc.v_sol_graduation, pc)  # PumpSwap price ~ terminal
+
+    def multiple(price, entry_vsol):
+        return price / curve_price_per_token(entry_vsol, pc)
+
+    # Exit at the terminal price, entering at graduation -> ~1x.
+    assert multiple(terminal, pc.v_sol_graduation) == pytest.approx(1.0)
+    # Entering at half the graduation vSol quadruples the multiple (V**2 law).
+    assert multiple(terminal, pc.v_sol_graduation / 2) == pytest.approx(4.0)
+    # Representative entry vSol = v_grad/sqrt(5) reproduces the legacy ~5x default
+    # when the PumpSwap price equals the terminal price.
+    from live_monitor import _representative_entry_vsol
+    rep = _representative_entry_vsol(pc)
+    assert multiple(terminal, rep) == pytest.approx(5.0)
+
+
+def test_pool_price_from_tx():
+    """_pool_price_from_tx reads price from the pool's reserves (WSOL/base),
+    picking the largest-base holder as the pool and ignoring a trader who
+    transiently holds both legs. Regression: the old code paired the mint's token
+    delta with the fee-payer's lamport delta — unrelated accounts — yielding
+    garbage prices spanning 1e-15 to 1e-2."""
+    from config import PUMP_SWAP_PROGRAM_ID, WRAPPED_SOL_MINT
+    from live_monitor import _pool_price_from_tx
+
+    MINT = "MintXXXXpump"
+    POOL, TRADER = "PoolOwner", "TraderOwner"
+    tx = {
+        "transaction": {"message": {"accountKeys": [
+            {"pubkey": "whatever"}, {"pubkey": PUMP_SWAP_PROGRAM_ID},
+        ]}},
+        "meta": {"postTokenBalances": [
+            # pool vaults: 160M tokens, 108 WSOL -> price = 108/160e6 = 6.75e-7
+            {"owner": POOL, "mint": MINT, "uiTokenAmount": {"uiAmount": 160_000_000.0}},
+            {"owner": POOL, "mint": WRAPPED_SOL_MINT, "uiTokenAmount": {"uiAmount": 108.0}},
+            # a trader holding both legs but tiny base -> must NOT be chosen
+            {"owner": TRADER, "mint": MINT, "uiTokenAmount": {"uiAmount": 5000.0}},
+            {"owner": TRADER, "mint": WRAPPED_SOL_MINT, "uiTokenAmount": {"uiAmount": 9.0}},
+        ]},
+    }
+    assert _pool_price_from_tx(tx, MINT) == pytest.approx(108.0 / 160_000_000.0)
+
+    # Not a PumpSwap tx -> None (program id absent).
+    tx_no_amm = {"transaction": {"message": {"accountKeys": [{"pubkey": "x"}]}},
+                 "meta": {"postTokenBalances": tx["meta"]["postTokenBalances"]}}
+    assert _pool_price_from_tx(tx_no_amm, MINT) is None
+
+    # No account holds both legs -> None.
+    tx_one_leg = {"transaction": {"message": {"accountKeys": [{"pubkey": PUMP_SWAP_PROGRAM_ID}]}},
+                  "meta": {"postTokenBalances": [
+                      {"owner": POOL, "mint": MINT, "uiTokenAmount": {"uiAmount": 160e6}}]}}
+    assert _pool_price_from_tx(tx_one_leg, MINT) is None
+
+
+def test_graduation_price_plausibility_filter():
+    """Implausible PumpSwap prices (non-swap-tx garbage) are rejected so they
+    can't poison the payoff model; prices near the terminal price are kept."""
+    from config import curve_price_per_token, get_cached_constants
+    from live_monitor import _price_is_plausible
+
+    pc = get_cached_constants()
+    terminal = curve_price_per_token(pc.v_sol_graduation, pc)
+    assert _price_is_plausible(terminal, pc)
+    assert _price_is_plausible(5 * terminal, pc)
+    assert not _price_is_plausible(terminal * 1e6, pc)   # 35000x-style outlier
+    assert not _price_is_plausible(terminal * 1e-6, pc)  # near-zero outlier
+    assert not _price_is_plausible(0.0, pc)

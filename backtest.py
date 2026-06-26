@@ -48,7 +48,7 @@ from pathlib import Path
 
 import numpy as np
 
-from config import fee_at
+from config import curve_price_per_token, fee_at
 from conviction_engine import (
     Swap,
     _breakeven_probability,
@@ -302,13 +302,23 @@ def run_backtest(
                 decision = "SKIP"
 
             # Resolve the graduation payoff multiple from logged PumpSwap
-            # prices when available (charter I2). Falls back to the default 5x.
+            # prices when available (charter I2). Per-position exact: the real
+            # exit price over this trade's bonding-curve entry price (the vSol at
+            # the ENTER decision). Falls back to the row's representative multiple,
+            # then to the default 5x. Only meaningful on the entry row (the loop
+            # breaks once entered), where ``vsol`` is the entry vSol.
             payoff_mult = None
-            if graduated and mint in gp:
+            if entered and graduated and mint in gp:
                 row = gp[mint]
-                pm = row.get("payoff_multiple")
-                if isinstance(pm, (int, float)) and pm > 0:
-                    payoff_mult = float(pm)
+                price = row.get("price_sol_per_unit")
+                if isinstance(price, (int, float)) and price > 0:
+                    entry_price = curve_price_per_token(vsol)
+                    if entry_price > 0:
+                        payoff_mult = float(price) / entry_price
+                if payoff_mult is None:
+                    pm = row.get("payoff_multiple")
+                    if isinstance(pm, (int, float)) and pm > 0:
+                        payoff_mult = float(pm)
             trades.append(TradeOutcome(
                 mint=mint, as_of_ts=as_of, decision=decision,
                 est_grad_prob=est, breakeven_prob=brk, edge=edge,
