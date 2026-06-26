@@ -134,6 +134,21 @@ All notable changes to the pumpfun conviction scoring system.
 
 ---
 
+## Storage durability & scale (code review)
+
+`storage.py` / `cli.py` — addressing the SQLite hot-path, WAL growth, and retention findings.
+
+- **Composite `(mint, ts)` index** — `ix_swaps_mint_ts` replaces the standalone `ix_swaps_mint`. The hot query (`swaps_for`, backtest, live scoring) filters by `mint` then reads in `ts` order; the composite lets SQLite seek + walk pre-sorted instead of merging two single-column index scans. The redundant `ix_swaps_mint` is dropped on open (its leftmost column is covered by the composite). `ix_swaps_ts` kept for the retention scan. Migration is automatic on next `Store(...)` open.
+- **WAL checkpoint strategy** — `Store.checkpoint()` runs `PRAGMA wal_checkpoint(TRUNCATE)`; called on every open (startup) and after a prune. Without it the WAL grew unbounded under the long-lived `live_monitor` writer (live db had a 4 MB `-wal`; now truncated to 0).
+- **`n_swaps` drift** — extracted `Store._recompute_n_swaps()`, the single re-derivation from actual rows. Every delete path (`dedupe_swaps`, new `prune_swaps_before`) now calls it, so the denormalized counter can't desync after a delete.
+- **Dedupe key documented** — `dedupe_swaps` deliberately keys on `(mint, ts, wallet, is_buy, sol_amount, vsol_after)`: two genuinely distinct trades move the curve, so their `vsol_after` differs and they survive; only byte-identical replay rows collapse. `id`/`ingested_at` excluded by design. Added a test asserting distinct same-`ts` swaps are not collapsed.
+- **Data retention** — `Store.prune_swaps_before(cutoff_ts)` deletes old swaps, re-derives `n_swaps`, and checkpoints. Wired into `cli.py export --prune-days N`: exports the full-history Parquet snapshot first (the analytical source of truth), then prunes SQLite to a rolling window so `swaps` doesn't grow without bound.
+- **Atomic delete + recompute** — `dedupe_swaps` / `prune_swaps_before` wrap their `DELETE` and `_recompute_n_swaps()` in a single transaction (same pattern as `log_swap`); a crash between them previously left `n_swaps` stale. Prune's WAL checkpoint runs after `COMMIT` (can't checkpoint inside a transaction).
+- **Streaming Parquet export** — `export_parquet` streams the (unbounded) `swaps` table through `ParquetWriter` in `_PARQUET_EXPORT_BATCH`-row pages (`Store._write_swaps_parquet`) instead of `fetchall` + one `from_pylist`, so peak memory is one batch regardless of table size. The bounded `tokens`/`graduation_prices` tables stay in-memory. Schema pulled out to `_SWAPS_PARQUET_SCHEMA`. Empty table still yields a valid readable file.
+- **Periodic WAL checkpoint on long runs** — `live_monitor` calls `store.checkpoint()` every `WAL_CHECKPOINT_EVERY_SEC` (6 h), gated behind swap activity (only writes grow the WAL). Closes the gap left by the open-only checkpoint for a monitor that runs for days without restart.
+
+---
+
 ## Dependencies added
 
 - `solders` — PDA derivation for bonding-curve addresses.

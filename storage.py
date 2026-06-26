@@ -50,8 +50,15 @@ CREATE TABLE IF NOT EXISTS swaps (
     source      TEXT    NOT NULL DEFAULT 'pumpportal',  -- feed provenance
     ingested_at REAL    NOT NULL
 );
-CREATE INDEX IF NOT EXISTS ix_swaps_mint ON swaps(mint);
-CREATE INDEX IF NOT EXISTS ix_swaps_ts   ON swaps(ts);
+-- Composite (mint, ts) is the hot path: swaps_for / the backtest / live
+-- scoring all filter by mint then read in ts order. A single covering index
+-- lets SQLite seek the mint and walk it pre-sorted instead of scanning the
+-- mint index, scanning the ts index, and merging. ix_swaps_ts is kept for the
+-- retention/prune scan (WHERE ts < cutoff across all mints); ix_swaps_mint is
+-- redundant given the composite (its leftmost column is mint) and is dropped.
+CREATE INDEX IF NOT EXISTS ix_swaps_mint_ts ON swaps(mint, ts);
+CREATE INDEX IF NOT EXISTS ix_swaps_ts      ON swaps(ts);
+DROP INDEX IF EXISTS ix_swaps_mint;
 """
 
 SCHEMA_TOKENS = """
@@ -137,6 +144,24 @@ CREATE TABLE IF NOT EXISTS graduation_prices (
 # Outcome vocabulary. ``unknown`` means we haven't classified it yet.
 OUTCOMES = {"graduated", "stalled", "rugged", "unknown"}
 
+# Parquet schema for the swaps snapshot. Pulled out of export_parquet so the
+# streaming writer and any future reader agree on one definition.
+_SWAPS_PARQUET_SCHEMA = pa.schema([
+    ("mint", pa.string()),
+    ("ts", pa.float64()),
+    ("wallet", pa.string()),
+    ("is_buy", pa.bool_()),
+    ("sol_amount", pa.float64()),
+    ("vsol_after", pa.float64()),
+    ("via_frontend", pa.bool_()),
+    ("source", pa.string()),
+    ("ingested_at", pa.float64()),
+])
+
+# Rows pulled from SQLite per batch when streaming the swaps snapshot. Bounds
+# peak memory to one batch instead of the whole table; ~50k rows is a few MB.
+_PARQUET_EXPORT_BATCH = 50_000
+
 
 @dataclass
 class TokenRow:
@@ -169,6 +194,21 @@ class Store:
         self.conn.executescript(SCHEMA_SWAPS)
         self.conn.executescript(SCHEMA_TOKENS)
         self.conn.executescript(SCHEMA_PAPER)
+        # Truncate the WAL on open. Without an explicit checkpoint the WAL grows
+        # unbounded under a long-lived writer (SQLite only auto-checkpoints when
+        # the WAL crosses wal_autocheckpoint pages, and never truncates the file
+        # back down), so a multi-day live_monitor leaves a multi-GB -wal behind.
+        # Startup is the natural point: no readers are mid-query yet.
+        self.checkpoint()
+
+    def checkpoint(self) -> None:
+        """Flush the WAL into the main db and truncate it back to zero.
+
+        Safe to call any time; TRUNCATE blocks only if a reader is mid-read on
+        an old snapshot. Call periodically (startup, and e.g. after each daily
+        export) to keep ``pumpfun.db-wal`` from growing without bound.
+        """
+        self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
 
     # ------------------------------------------------------------------ swaps
     def log_swap(
@@ -244,6 +284,23 @@ class Store:
             self.conn.execute("ROLLBACK")
             raise
 
+    def _recompute_n_swaps(self) -> None:
+        """Re-derive ``tokens.n_swaps`` from the actual swap rows.
+
+        ``n_swaps`` is a denormalized counter maintained incrementally in
+        :meth:`_log_swap_inner`. Any path that *removes* rows from ``swaps``
+        (dedupe, retention pruning, or a manual DELETE) desyncs it, which then
+        skews every per-swap feature in the training set. Every delete path must
+        call this so the counter stays the single derived truth. It's a full
+        re-count, so it's O(rows) — cheap relative to the delete that triggered
+        it, and only run on maintenance paths, never on the hot insert path.
+        """
+        self.conn.execute(
+            """UPDATE tokens SET n_swaps = (
+                 SELECT COUNT(*) FROM swaps WHERE swaps.mint = tokens.mint
+               )"""
+        )
+
     def dedupe_swaps(self) -> int:
         """Remove duplicate swap rows (same mint, ts, wallet, is_buy, sol_amount,
         vsol_after). Returns the number of rows deleted.
@@ -254,21 +311,61 @@ class Store:
         — a correctness bug for the training set. Run this periodically (e.g. on
         startup) to keep the record honest. The first occurrence (lowest rowid)
         is kept; later duplicates are deleted.
+
+        The key deliberately includes ``vsol_after``: two *genuinely distinct*
+        trades by the same wallet at the same ``ts`` for the same ``sol_amount``
+        still move the bonding curve, so their ``vsol_after`` differs and they
+        are not collapsed. Only byte-identical event rows (i.e. a true replay of
+        the same on-chain event) share all six columns. ``id``/``ingested_at``
+        are excluded on purpose — they differ across replays of the same event,
+        so including them would defeat the dedupe.
         """
-        cur = self.conn.execute(
-            """DELETE FROM swaps WHERE id NOT IN (
-                 SELECT MIN(id) FROM swaps
-                 GROUP BY mint, ts, wallet, is_buy, sol_amount, vsol_after
-               )"""
-        )
-        deleted = cur.rowcount or 0
-        if deleted:
-            # Recompute n_swaps per token to match the deduped swaps table.
-            self.conn.execute(
-                """UPDATE tokens SET n_swaps = (
-                     SELECT COUNT(*) FROM swaps WHERE swaps.mint = tokens.mint
+        # DELETE + recompute must be atomic: a crash between them would leave
+        # n_swaps stale — the exact drift this guards against. Same single-txn
+        # pattern as log_swap/log_swaps.
+        self.conn.execute("BEGIN")
+        try:
+            cur = self.conn.execute(
+                """DELETE FROM swaps WHERE id NOT IN (
+                     SELECT MIN(id) FROM swaps
+                     GROUP BY mint, ts, wallet, is_buy, sol_amount, vsol_after
                    )"""
             )
+            deleted = cur.rowcount or 0
+            if deleted:
+                self._recompute_n_swaps()
+            self.conn.execute("COMMIT")
+        except Exception:
+            self.conn.execute("ROLLBACK")
+            raise
+        return deleted
+
+    def prune_swaps_before(self, cutoff_ts: float) -> int:
+        """Delete swaps with ``ts < cutoff_ts`` and re-derive ``n_swaps``.
+
+        The ``swaps`` table is append-only and grows without bound; past ~10M
+        rows the Parquet export and every ``swaps_for`` scan slow down. Keep a
+        rolling window in SQLite (the live/training-hot data) and let the older
+        rows live only in the immutable Parquet snapshots, which are the
+        analytical source anyway. **Export a snapshot covering the window first**
+        (:meth:`export_parquet`) — pruning is destructive to SQLite. Returns the
+        number of rows deleted; runs the WAL checkpoint so the freed pages don't
+        sit in an ever-growing WAL after a large delete.
+        """
+        # DELETE + recompute atomic (see dedupe_swaps). The checkpoint runs
+        # *after* COMMIT — wal_checkpoint can't run inside an open transaction.
+        self.conn.execute("BEGIN")
+        try:
+            cur = self.conn.execute("DELETE FROM swaps WHERE ts < ?", (cutoff_ts,))
+            deleted = cur.rowcount or 0
+            if deleted:
+                self._recompute_n_swaps()
+            self.conn.execute("COMMIT")
+        except Exception:
+            self.conn.execute("ROLLBACK")
+            raise
+        if deleted:
+            self.checkpoint()
         return deleted
 
     # --------------------------------------------------------------- tokens
@@ -349,49 +446,63 @@ class Store:
         ]
 
     # ------------------------------------------------------------ parquet
+    def _write_swaps_parquet(self, path: Path) -> None:
+        """Stream the ``swaps`` table to a Parquet file in bounded batches.
+
+        ``swaps`` is the only unbounded table; ``fetchall`` + a single
+        ``from_pylist`` would hold the whole table (twice) in RAM, which is the
+        export bottleneck past a few million rows. We page through it with a
+        server-side cursor and write one row group per batch, so peak memory is
+        ``_PARQUET_EXPORT_BATCH`` rows regardless of table size. The writer
+        emits a valid (empty) file even when there are no rows.
+        """
+        cur = self.conn.execute(
+            "SELECT mint, ts, wallet, is_buy, sol_amount, vsol_after, via_frontend, "
+            "source, ingested_at FROM swaps"
+        )
+        writer = pq.ParquetWriter(str(path), _SWAPS_PARQUET_SCHEMA)  # type: ignore[no-untyped-call]
+        try:
+            while True:
+                rows = cur.fetchmany(_PARQUET_EXPORT_BATCH)
+                if not rows:
+                    break
+                batch = pa.Table.from_pylist(
+                    [
+                        {
+                            "mint": r["mint"],
+                            "ts": r["ts"],
+                            "wallet": r["wallet"],
+                            "is_buy": bool(r["is_buy"]),
+                            "sol_amount": r["sol_amount"],
+                            "vsol_after": r["vsol_after"],
+                            "via_frontend": bool(r["via_frontend"]),
+                            "source": r["source"],
+                            "ingested_at": r["ingested_at"],
+                        }
+                        for r in rows
+                    ],
+                    schema=_SWAPS_PARQUET_SCHEMA,
+                )
+                writer.write_table(batch)  # type: ignore[no-untyped-call]
+        finally:
+            writer.close()  # type: ignore[no-untyped-call]
+
     def export_parquet(self, out_dir: str | Path = "snapshots") -> Path:
         """Snapshot the whole store to Parquet. Returns the snapshot path.
 
         Two files: ``swaps_<ts>.parquet`` and ``tokens_<ts>.parquet``.
-        These are what :mod:`model` and :mod:`backtest` read from.
+        These are what :mod:`model` and :mod:`backtest` read from. The swaps
+        table is streamed in batches (see :meth:`_write_swaps_parquet`); the
+        bounded tables fit in memory.
         """
         out_dir = Path(out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
         ts = int(time.time())
 
-        swap_rows = self.conn.execute(
-            "SELECT mint, ts, wallet, is_buy, sol_amount, vsol_after, via_frontend, "
-            "source, ingested_at FROM swaps"
-        ).fetchall()
-        token_rows = self.conn.execute("SELECT * FROM tokens").fetchall()
+        s_path = out_dir / f"swaps_{ts}.parquet"
+        self._write_swaps_parquet(s_path)
 
-        swaps_table = pa.Table.from_pylist(
-            [
-                {
-                    "mint": r["mint"],
-                    "ts": r["ts"],
-                    "wallet": r["wallet"],
-                    "is_buy": bool(r["is_buy"]),
-                    "sol_amount": r["sol_amount"],
-                    "vsol_after": r["vsol_after"],
-                    "via_frontend": bool(r["via_frontend"]),
-                    "source": r["source"],
-                    "ingested_at": r["ingested_at"],
-                }
-                for r in swap_rows
-            ],
-            schema=pa.schema([
-                ("mint", pa.string()),
-                ("ts", pa.float64()),
-                ("wallet", pa.string()),
-                ("is_buy", pa.bool_()),
-                ("sol_amount", pa.float64()),
-                ("vsol_after", pa.float64()),
-                ("via_frontend", pa.bool_()),
-                ("source", pa.string()),
-                ("ingested_at", pa.float64()),
-            ]),
-        )
+        token_rows = self.conn.execute("SELECT * FROM tokens").fetchall()
         tokens_table = pa.Table.from_pylist(
             [
                 {
@@ -422,10 +533,8 @@ class Store:
             ]),
         )
 
-        s_path = out_dir / f"swaps_{ts}.parquet"
         t_path = out_dir / f"tokens_{ts}.parquet"
         g_path = out_dir / f"graduation_prices_{ts}.parquet"
-        pq.write_table(swaps_table, s_path)  # type: ignore[no-untyped-call]
         pq.write_table(tokens_table, t_path)  # type: ignore[no-untyped-call]
 
         # Graduation prices (post-graduation PumpSwap first-trade price).

@@ -128,8 +128,18 @@ def cmd_fit(args: argparse.Namespace) -> int:
 def cmd_export(args: argparse.Namespace) -> int:
     store = Store(args.db)
     p = store.export_parquet(args.out_dir)
-    store.close()
     print(f"snapshot written: {p}")
+    # Optional retention: now that the full history is captured in the immutable
+    # snapshot we just wrote, drop swaps older than the rolling window from
+    # SQLite so the live db (and every swaps_for scan) stays small. The Parquet
+    # snapshot remains the complete analytical record.
+    if args.prune_days is not None:
+        import time
+        cutoff = time.time() - args.prune_days * 86400.0
+        deleted = store.prune_swaps_before(cutoff)
+        print(f"pruned {deleted} swap rows older than {args.prune_days} days "
+              f"(retained in snapshot {p})")
+    store.close()
     return 0
 
 
@@ -159,6 +169,11 @@ def main() -> None:
     e = sub.add_parser("export", help="export SQLite -> Parquet snapshot")
     e.add_argument("--db", default="pumpfun.db")
     e.add_argument("--out-dir", default="snapshots")
+    e.add_argument(
+        "--prune-days", type=float, default=None,
+        help="after exporting, delete swaps older than this many days from "
+             "SQLite (rolling window; the snapshot keeps the full history)",
+    )
     e.set_defaults(func=cmd_export)
 
     args = ap.parse_args()

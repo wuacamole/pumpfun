@@ -27,8 +27,8 @@ from __future__ import annotations
 import json
 import math
 import time
-from collections.abc import Callable
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from rich.live import Live
