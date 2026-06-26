@@ -431,7 +431,7 @@ def _append_regime_entry_to_file(ts: float, sched: FeeSchedule) -> bool:
     try:
         text = config_path.read_text()
         ts_int = int(ts)
-        dt_str = _dt.datetime.fromtimestamp(ts, tz=_dt.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        dt_str = _dt.datetime.fromtimestamp(ts, tz=_dt.UTC).strftime("%Y-%m-%d %H:%M UTC")
         new_entry = (
             f"    # {dt_str} — on-chain fee change detected;"
             f" slippage/mev carried from prior entry.\n"
@@ -476,6 +476,7 @@ async def check_live_fee_regime(
         boundary; if omitted it defaults to time.time().
     """
     import time as _time
+
     import httpx
 
     # Reuse already-fetched pump constants if provided; otherwise re-fetch.
