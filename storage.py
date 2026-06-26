@@ -302,15 +302,24 @@ class Store:
         are excluded on purpose — they differ across replays of the same event,
         so including them would defeat the dedupe.
         """
-        cur = self.conn.execute(
-            """DELETE FROM swaps WHERE id NOT IN (
-                 SELECT MIN(id) FROM swaps
-                 GROUP BY mint, ts, wallet, is_buy, sol_amount, vsol_after
-               )"""
-        )
-        deleted = cur.rowcount or 0
-        if deleted:
-            self._recompute_n_swaps()
+        # DELETE + recompute must be atomic: a crash between them would leave
+        # n_swaps stale — the exact drift this guards against. Same single-txn
+        # pattern as log_swap/log_swaps.
+        self.conn.execute("BEGIN")
+        try:
+            cur = self.conn.execute(
+                """DELETE FROM swaps WHERE id NOT IN (
+                     SELECT MIN(id) FROM swaps
+                     GROUP BY mint, ts, wallet, is_buy, sol_amount, vsol_after
+                   )"""
+            )
+            deleted = cur.rowcount or 0
+            if deleted:
+                self._recompute_n_swaps()
+            self.conn.execute("COMMIT")
+        except Exception:
+            self.conn.execute("ROLLBACK")
+            raise
         return deleted
 
     def prune_swaps_before(self, cutoff_ts: float) -> int:
@@ -325,10 +334,19 @@ class Store:
         number of rows deleted; runs the WAL checkpoint so the freed pages don't
         sit in an ever-growing WAL after a large delete.
         """
-        cur = self.conn.execute("DELETE FROM swaps WHERE ts < ?", (cutoff_ts,))
-        deleted = cur.rowcount or 0
+        # DELETE + recompute atomic (see dedupe_swaps). The checkpoint runs
+        # *after* COMMIT — wal_checkpoint can't run inside an open transaction.
+        self.conn.execute("BEGIN")
+        try:
+            cur = self.conn.execute("DELETE FROM swaps WHERE ts < ?", (cutoff_ts,))
+            deleted = cur.rowcount or 0
+            if deleted:
+                self._recompute_n_swaps()
+            self.conn.execute("COMMIT")
+        except Exception:
+            self.conn.execute("ROLLBACK")
+            raise
         if deleted:
-            self._recompute_n_swaps()
             self.checkpoint()
         return deleted
 
