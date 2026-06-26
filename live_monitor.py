@@ -406,10 +406,16 @@ async def run(
     def _vsol_for(mint: str, sw: Swap) -> float:
         """Fill in vsol_after: prefer on-chain reserves, else reconstruct from history."""
         # Fee in effect at this swap's ts — was hardcoded 0.0125; now date-keyed.
+        v_start = get_cached_constants().virtual_sol_start
         fee_rate = fee_at(sw.ts).curve_fee_rate
-        prev = HISTORY[mint][-1].vsol_after if HISTORY[mint] else get_cached_constants().virtual_sol_start
+        prev = HISTORY[mint][-1].vsol_after if HISTORY[mint] else v_start
         delta = sw.sol_amount * (1 - fee_rate) * (1 if sw.is_buy else -1)
-        return prev + delta
+        # Floor at the virtual seed: vSol = virtual reserves (constant ~30) + real
+        # reserves (>= 0), so it can never fall below v_start. This reconstruction
+        # is approximate and can undershoot on a big sell; without the floor a
+        # negative vsol_after gets logged (polluting the training set) and later
+        # crashes the fractional-power grad-prob math downstream.
+        return max(prev + delta, v_start)
 
     # USDC-paired tokens have a different breakeven geometry; exclude them from
     # scoring + the training set until a USDC path is built. Detected once per
