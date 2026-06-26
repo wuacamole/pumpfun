@@ -1,0 +1,25 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Secrets — never commit
+.env
+.env.*
+*.pem
+*.key
+
+# Local stores / snapshots / models / logs
+*.db
+*.db-*
+snapshots/
+models/
+alerts.log
+backtest_report.json
+metrics.jsonl
