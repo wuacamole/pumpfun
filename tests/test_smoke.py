@@ -912,6 +912,46 @@ def test_graduation_payoff_per_position():
     assert multiple(terminal, rep) == pytest.approx(5.0)
 
 
+def test_is_direct_pump_call():
+    """Direct-call bot detection from logs (0 RPC): Pump at top level [1] = direct
+    (autonomous bot); Pump only nested under a router = routed (not direct)."""
+    from config import PUMP_PROGRAM_ID
+    from helius import is_direct_pump_call
+
+    direct = [
+        "Program ComputeBudget111111111111111111111111111111 invoke [1]",
+        f"Program {PUMP_PROGRAM_ID} invoke [1]",
+        "Program log: Instruction: Buy",
+    ]
+    routed = [
+        "Program GMgnVFR8Jb39LoXsEVzb3DvBy3ywCmdmJquHUy1Lrkqb invoke [1]",
+        "Program log: Instruction: Buy",
+        f"Program {PUMP_PROGRAM_ID} invoke [2]",  # nested under the router
+        "Program log: Instruction: Buy",
+    ]
+    assert is_direct_pump_call(direct) is True
+    assert is_direct_pump_call(routed) is False
+    assert is_direct_pump_call([]) is False
+
+
+def test_swap_is_direct_persists(tmp_path):
+    """is_direct round-trips to the swaps column; None stays NULL (unknown)."""
+    from conviction_engine import Swap
+    from storage import Store
+
+    s = Store(tmp_path / "d.db")
+    s.log_swap(Swap(ts=1.0, wallet="w1", is_buy=True, sol_amount=0.1,
+                    vsol_after=40.0, via_frontend=True, is_direct=True), "MintA")
+    s.log_swap(Swap(ts=2.0, wallet="w2", is_buy=True, sol_amount=0.2,
+                    vsol_after=41.0, via_frontend=False), "MintA")  # is_direct defaults None
+    rows = s.conn.execute(
+        "SELECT wallet, is_direct FROM swaps ORDER BY ts"
+    ).fetchall()
+    assert rows[0]["is_direct"] == 1
+    assert rows[1]["is_direct"] is None
+    s.close()
+
+
 def test_pool_price_from_tx():
     """_pool_price_from_tx reads price from the pool's reserves (WSOL/base),
     picking the largest-base holder as the pool and ignoring a trader who

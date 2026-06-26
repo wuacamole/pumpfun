@@ -195,6 +195,17 @@ _HUMAN_SOL_THRESHOLD = 0.05
 _READER_EOF = object()
 
 
+def is_direct_pump_call(logs: list[str]) -> bool:
+    """True if the Pump program is invoked at the TOP level (depth [1]) of the tx
+    — a direct contract call with no router/aggregator/bot program wrapping it.
+    This is the paper's ``isBot`` (autonomous sniper). Parsed from the
+    logsSubscribe ``logs`` we already receive, so zero extra RPC. Returns False
+    when Pump appears only nested (routed via another program: the pump.fun
+    frontend, Jupiter, a telegram bot, etc.)."""
+    marker = f"Program {PUMP_PROGRAM_ID} invoke [1]"
+    return any(line.startswith(marker) for line in logs)
+
+
 @dataclass
 class Reserves:
     """Decoded bonding-curve reserves, in SOL (not lamports)."""
@@ -712,6 +723,10 @@ class PumpLogsFeed:
                                     # No routing info in the event; use the size
                                     # heuristic (same rule as the no-RPC fallback).
                                     via_frontend=te.sol_amount >= _HUMAN_SOL_THRESHOLD,
+                                    # Direct-call bot flag, parsed from the logs we
+                                    # already have (0 RPC). Captured for a future
+                                    # model feature; doesn't affect via_frontend.
+                                    is_direct=is_direct_pump_call(logs),
                                 )
                                 yield ("swap", swap, te.mint, signature)
                                 continue

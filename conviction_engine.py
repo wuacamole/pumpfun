@@ -91,6 +91,13 @@ class Swap:
     sol_amount: float    # SOL in (buy) or out (sell), pre-fee
     vsol_after: float    # virtual SOL in the bonding curve just after this swap
     via_frontend: bool   # True if routed through pump.fun website; False = direct contract
+    # True if the Pump program was invoked directly at the top level (autonomous
+    # bot, the paper's isBot), False if routed via another program, None if
+    # unknown (no logs: PumpPortal/RPC paths). Parsed from logs at zero RPC cost;
+    # a candidate model feature once enough labelled data accumulates. Kept
+    # distinct from the size-heuristic ``via_frontend`` so the working model is
+    # unaffected until we deliberately retrain.
+    is_direct: bool | None = None
 
 
 @dataclass(frozen=True)

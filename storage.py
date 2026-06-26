@@ -46,7 +46,12 @@ CREATE TABLE IF NOT EXISTS swaps (
     is_buy      INTEGER NOT NULL,            -- 1 buy, 0 sell
     sol_amount  REAL    NOT NULL,
     vsol_after  REAL    NOT NULL,
-    via_frontend INTEGER NOT NULL,           -- 1 human (frontend-routed), 0 bot (direct)
+    via_frontend INTEGER NOT NULL,           -- 1 human (size heuristic), 0 small/bot
+    is_direct   INTEGER,                      -- 1 = pump invoked directly at top level
+                                             -- (autonomous bot, paper isBot), 0 = routed,
+                                             -- NULL = unknown (no logs: PumpPortal/RPC path).
+                                             -- Captured from logs (0 RPC); a candidate model
+                                             -- feature once enough labelled data accumulates.
     source      TEXT    NOT NULL DEFAULT 'pumpportal',  -- feed provenance
     ingested_at REAL    NOT NULL
 );
@@ -194,12 +199,20 @@ class Store:
         self.conn.executescript(SCHEMA_SWAPS)
         self.conn.executescript(SCHEMA_TOKENS)
         self.conn.executescript(SCHEMA_PAPER)
+        self._migrate()
         # Truncate the WAL on open. Without an explicit checkpoint the WAL grows
         # unbounded under a long-lived writer (SQLite only auto-checkpoints when
         # the WAL crosses wal_autocheckpoint pages, and never truncates the file
         # back down), so a multi-day live_monitor leaves a multi-GB -wal behind.
         # Startup is the natural point: no readers are mid-query yet.
         self.checkpoint()
+
+    def _migrate(self) -> None:
+        """Idempotent column adds for DBs created before a schema change.
+        CREATE TABLE IF NOT EXISTS won't add columns to an existing table."""
+        cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(swaps)")}
+        if "is_direct" not in cols:
+            self.conn.execute("ALTER TABLE swaps ADD COLUMN is_direct INTEGER")
 
     def checkpoint(self) -> None:
         """Flush the WAL into the main db and truncate it back to zero.
@@ -242,11 +255,12 @@ class Store:
         in a *single* outer transaction without nesting BEGIN/COMMIT (SQLite
         raises "cannot start a transaction within a transaction").
         """
+        is_direct = getattr(swap, "is_direct", None)
         self.conn.execute(
             """INSERT INTO swaps
                  (mint, ts, wallet, is_buy, sol_amount, vsol_after, via_frontend,
-                  source, ingested_at)
-               VALUES (?,?,?,?,?,?,?,?,?)""",
+                  is_direct, source, ingested_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?)""",
             (
                 mint,
                 swap.ts,
@@ -255,6 +269,7 @@ class Store:
                 swap.sol_amount,
                 swap.vsol_after,
                 1 if swap.via_frontend else 0,
+                None if is_direct is None else (1 if is_direct else 0),
                 source,
                 ingested_at if ingested_at is not None else time.time(),
             ),
