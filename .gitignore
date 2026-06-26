@@ -23,3 +23,6 @@ models/
 alerts.log
 backtest_report.json
 metrics.jsonl
+live_monitor.log
+pumpfun.log
+monitor.pid

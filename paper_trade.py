@@ -32,7 +32,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from config import fee_at, get_cached_constants
+from config import curve_price_per_token, fee_at, get_cached_constants
 from conviction_engine import Swap
 
 if TYPE_CHECKING:
@@ -259,15 +259,25 @@ class PaperBroker:
         pos = self.positions.pop(mint, None)
         if pos is None:
             return None
-        # Resolve the exit multiple: logged PumpSwap price > flat default.
+        # Resolve the exit multiple. Charter I2: value the exit at the real
+        # PumpSwap first-trade price relative to THIS position's bonding-curve
+        # entry price (per-position exact). Order of preference:
+        #   1. real price / curve_price_per_token(this position's entry vSol)
+        #   2. the row's representative multiple (entry vSol unavailable)
+        #   3. the flat default (no logged price at all).
         multiple = self.default_graduation_multiple
         if self.graduation_price_lookup is not None:
             try:
                 gp = self.graduation_price_lookup(mint)
                 if gp is not None:
-                    price, logged_multiple = gp
-                    if logged_multiple is not None and logged_multiple > 0:
-                        multiple = logged_multiple
+                    price, representative_multiple = gp
+                    entry_price = curve_price_per_token(
+                        pos.entry_vsol, get_cached_constants()
+                    )
+                    if price is not None and price > 0 and entry_price > 0:
+                        multiple = price / entry_price
+                    elif representative_multiple is not None and representative_multiple > 0:
+                        multiple = representative_multiple
             except Exception:
                 pass  # fall back to default — never block the exit on a lookup error
         gross_exit = pos.entry_sol * multiple

@@ -57,6 +57,10 @@ PUMP_SWAP_GLOBAL_CONFIG = "ADyA8hdefvWN2dbGGWFotbzWxrAvLW83WG6QCVXvJKqw"
 WRAPPED_SOL_MINT = "So11111111111111111111111111111111111111112"
 USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 LAMPORTS_PER_SOL = 1_000_000_000.0
+# Pump.fun mints are always 6 decimals. Needed to convert the raw token reserves
+# in ProtocolConstants into whole-token units, so a bonding-curve price expressed
+# in SOL per *whole* token lines up with the PumpSwap first-trade price.
+TOKEN_DECIMALS = 6
 
 # --- Locked holdout fence (charter §9.1) ------------------------------------
 # The most recent contiguous time slice reserved as the holdout. Tokens whose
@@ -360,6 +364,33 @@ def set_cached_constants(pc: ProtocolConstants) -> None:
     """Populate the cache (called by :func:`load_protocol_constants`)."""
     global _cached
     _cached = pc
+
+
+def curve_price_per_token(v_sol: float, pc: ProtocolConstants | None = None) -> float:
+    """Bonding-curve spot price in SOL per *whole* token at virtual-SOL reserve
+    ``v_sol``.
+
+    The curve is constant-product: ``vSol * vTok = k`` with
+    ``k = initial_virtual_sol_reserves * initial_virtual_token_reserves``. At
+    reserve ``V`` the remaining tokens are ``k / V``, so the price is
+    ``V / (k / V) = V**2 / k`` (SOL per raw token); dividing the token side by
+    ``10**TOKEN_DECIMALS`` puts it in SOL per whole token, comparable to the
+    PumpSwap first-trade price. This is the canonical entry/exit price used to
+    turn a logged PumpSwap price into a per-position payoff multiple
+    (``price / curve_price_per_token(entry_vsol)``) — charter I2.
+
+    Returns 0.0 for degenerate inputs (non-positive vSol or reserves).
+    """
+    if pc is None:
+        pc = get_cached_constants()
+    if v_sol <= 0:
+        return 0.0
+    k_whole = pc.initial_virtual_sol_reserves * (
+        pc.initial_virtual_token_reserves / 10 ** TOKEN_DECIMALS
+    )
+    if k_whole <= 0:
+        return 0.0
+    return v_sol * v_sol / k_whole
 
 
 async def load_protocol_constants(rpc_url: str) -> ProtocolConstants:

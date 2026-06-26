@@ -33,6 +33,7 @@ import argparse
 import asyncio
 import contextlib
 import json
+import math
 import os
 import time
 from collections import defaultdict
@@ -44,7 +45,14 @@ load_dotenv()  # reads .env in cwd; harmless if absent
 
 from rich.live import Live  # noqa: E402
 
-from config import fee_at, get_cached_constants  # noqa: E402
+from config import (  # noqa: E402
+    PUMP_SWAP_PROGRAM_ID,
+    WRAPPED_SOL_MINT,
+    ProtocolConstants,
+    curve_price_per_token,
+    fee_at,
+    get_cached_constants,
+)
 from conviction_engine import (  # noqa: E402
     Swap,
     TokenScore,
@@ -79,6 +87,13 @@ SUBSCRIBED: set[str] = set()
 # Tunables
 MIN_SWAPS_TO_SCORE = 8
 RESCORE_EVERY_SEC  = 2.0
+# Model-based ENTER gate: enter when the *calibrated* model's P(graduation)
+# clears the breakeven probability by this margin. Replaces the old hand-built
+# conviction_score>=55 + bot_share<0.6 filters, which validate_conviction.py
+# showed were anti-predictive (they vetoed the bot-driven tokens that actually
+# graduate). The model already uses bot_share / sol_per_human as features, so it
+# learns their true sign — no hand filter on top. See [[conviction-engine-inverted]].
+ENTER_EDGE_MARGIN = 0.05
 STALE_AFTER_SEC    = 900
 PRINT_DECISIONS    = {"ENTER", "WATCH"}
 # Cap on concurrent per-token trade subscriptions. PumpPortal charges
@@ -93,6 +108,20 @@ MAX_TOKENS = 1000
 # WAL grows between restarts. Checkpoint on this cadence to keep it bounded.
 # Gated behind swap activity (only writes grow the WAL), so it's a no-op when idle.
 WAL_CHECKPOINT_EVERY_SEC = 6 * 3600
+# Run paper-broker exit checks at most this often instead of on every swap. Under
+# the Pump firehose (~600 swaps/s) the old per-swap check rebuilt a dict over all
+# tracked mints each time — O(mints) per swap — which starved the event loop and
+# stalled the websocket read. Time/loss stops don't need sub-second granularity.
+CHECK_EXITS_EVERY_SEC = 2.0
+# Flat graduation payoff used when no real PumpSwap price is logged. The exact
+# per-position multiple is price/curve_price_per_token(entry_vsol); this is only
+# the pre-data-collection placeholder (kept in sync with PaperBroker's default).
+DEFAULT_GRADUATION_MULTIPLE = 5.0
+# Plausibility band for a logged PumpSwap first-trade price, as a multiple of the
+# bonding-curve terminal price. _fetch_pumpswap_first_price occasionally reads a
+# non-swap tx (liquidity add, transfer) and returns a wildly wrong ratio; prices
+# outside this band are rejected so they can't poison the payoff model.
+GRAD_PRICE_MIN_X, GRAD_PRICE_MAX_X = 0.01, 100.0
 
 
 def _approx_via_frontend(evt: dict[str, Any]) -> bool:
@@ -180,31 +209,46 @@ async def _to_swap(evt: dict[str, Any], mint: str, helius: HeliusClient | None) 
     )
 
 
-def _broker_graduation_price(mint: str, store: Store) -> tuple[float, float] | None:
-    """Lookup hook for PaperBroker.on_graduated: return (price, payoff_multiple)
-    from the logged graduation_prices table, or None to fall back to the default.
+def _broker_graduation_price(mint: str, store: Store) -> tuple[float, float | None] | None:
+    """Lookup hook for PaperBroker.on_graduated. Returns
+    ``(price_sol_per_unit, representative_payoff_multiple)`` from the logged
+    graduation_prices row, or None when nothing is logged for this mint.
 
-    The multiple is derived from the bonding-curve terminal price: at graduation
-    the bonding-curve's vSol is ~115, so a 1-SOL entry at vSol V buys
-    (1 / price_at_v) units; the exit value at the PumpSwap price P is
-    (units * P) = P / price_at_v. We approximate price_at_v as the vSol-ratio
-    implied entry price (entry_vsol / total_supply_at_graduation), which for the
-    flat default case yields ~5x. When a logged entry_vsol is present we compute
-    the per-position multiple exactly; otherwise we return the stored
-    payoff_multiple directly.
+    The PumpSwap ``price`` is the authoritative datum: the broker computes the
+    exact per-position multiple as ``price / curve_price_per_token(pos.entry_vsol)``
+    (charter I2). The second element is only the table's representative multiple,
+    used as a fallback when the position's entry vSol is unavailable.
     """
     row = store.get_graduation_price(mint)
     if row is None:
         return None
     price = row.get("price_sol_per_unit")
+    if not isinstance(price, (int, float)) or price <= 0:
+        return None
     pm = row.get("payoff_multiple")
-    if isinstance(price, (int, float)) and price > 0:
-        # If we have a logged payoff_multiple, use it; else return the price
-        # and let the broker compute a rough multiple from the default 5x.
-        if isinstance(pm, (int, float)) and pm > 0:
-            return float(price), float(pm)
-        return float(price), 5.0
-    return None
+    rep = float(pm) if isinstance(pm, (int, float)) and pm > 0 else None
+    return float(price), rep
+
+
+def _representative_entry_vsol(pc: ProtocolConstants) -> float:
+    """A single entry vSol used only for the *reporting* payoff_multiple stored
+    in graduation_prices. The broker and backtest never read it — they compute
+    the exact multiple from each trade's own entry vSol. It's chosen so that when
+    the PumpSwap price equals the bonding-curve terminal price the stored
+    multiple equals the legacy flat default: (v_sol_graduation / V)**2 = default
+    -> V = v_sol_graduation / sqrt(default).
+    """
+    return pc.v_sol_graduation / math.sqrt(DEFAULT_GRADUATION_MULTIPLE)
+
+
+def _price_is_plausible(price: float, pc: ProtocolConstants) -> bool:
+    """True if a logged PumpSwap first-trade price sits in a believable band
+    around the bonding-curve terminal price. Filters out the non-swap-tx garbage
+    that _fetch_pumpswap_first_price sometimes returns (see GRAD_PRICE_*_X)."""
+    terminal = curve_price_per_token(pc.v_sol_graduation, pc)
+    if terminal <= 0 or price <= 0:
+        return False
+    return GRAD_PRICE_MIN_X * terminal <= price <= GRAD_PRICE_MAX_X * terminal
 
 
 async def _record_graduation_price(
@@ -212,79 +256,96 @@ async def _record_graduation_price(
     graduation_ts: float,
     helius: HeliusClient | None,
     store: Store,
+    pc: ProtocolConstants,
 ) -> None:
     """Best-effort: fetch the PumpSwap first-trade price for a freshly
-    graduated token and log it to SQLite. The backtest and paper broker use
-    this to value exits at the real market price (charter I2) instead of a
-    flat 5x placeholder. Non-blocking on failure — the broker falls back.
+    graduated token and log it to SQLite. The backtest and paper broker value
+    exits at this real market price (charter I2) — each computes the per-position
+    payoff multiple from its own entry vSol via curve_price_per_token; the
+    entry_vsol/payoff_multiple stored here are a representative summary only.
+    Non-blocking on failure — both consumers fall back to the flat default.
     """
     if helius is None:
         return
     try:
-        price = await _fetch_pumpswap_first_price(mint, helius)
+        price = await _fetch_pumpswap_price(mint, helius)
         if price is None:
             return
-        # The payoff multiple vs a 1-SOL entry at the bonding-curve terminal
-        # price. We don't know each position's exact entry vSol here; the
-        # backtest computes per-trade multiples from the entry_vsol column.
-        # For the live paper broker, a single representative multiple is fine
-        # since all open positions in the same token exit at the same price.
+        if not _price_is_plausible(price, pc):
+            return  # likely a non-swap tx — don't poison the payoff model
+        rep_vsol = _representative_entry_vsol(pc)
+        rep_entry_price = curve_price_per_token(rep_vsol, pc)
+        rep_multiple = price / rep_entry_price if rep_entry_price > 0 else None
         store.record_graduation_price(
             mint=mint,
             graduation_ts=graduation_ts,
             price_sol_per_unit=price,
+            entry_vsol=rep_vsol,
+            payoff_multiple=rep_multiple,
         )
     except Exception:
         pass  # never block graduation handling on a price fetch failure
 
 
-async def _fetch_pumpswap_first_price(mint: str, helius: HeliusClient) -> float | None:
-    """Fetch the first PumpSwap swap price for a graduated token (SOL per unit).
+def _pool_price_from_tx(tx: dict[str, Any], mint: str) -> float | None:
+    """Extract the PumpSwap spot price (SOL per whole token) from a swap tx by
+    reading the *pool's reserves*: WSOL_reserve / base_reserve.
 
-    Uses getSignaturesForAddress on the PumpSwap pool account to find the first
-    swap, then reads the token/SOL balance deltas from that tx. Returns None if
-    the pool or first swap can't be found. This is a best-effort price discovery
-    — the bonding-curve terminal price is the fallback when this fails.
+    The pool's two vaults share one owner (the pool account) that appears in the
+    tx's postTokenBalances holding BOTH the base mint and wrapped SOL. We pick the
+    such owner with the largest base balance (the pool dwarfs any trader who
+    transiently holds both legs). This reads reserves directly, so — unlike the
+    old delta-pairing — the numerator and denominator always come from the same
+    account and the result can't be skewed by fees or unrelated transfers.
+    Returns None if the tx isn't a PumpSwap swap or no pool vault pair is found.
     """
-    # The PumpSwap pool PDA is derived from the base mint. We don't have the
-    # exact PDA seeds here without the PumpSwap IDL, so fall back to scanning
-    # the token's recent signatures for a PumpSwap swap instruction.
+    keys = (tx.get("transaction", {}) or {}).get("message", {}).get("accountKeys", [])
+    keystrs = [k.get("pubkey") if isinstance(k, dict) else k for k in keys]
+    if PUMP_SWAP_PROGRAM_ID not in keystrs:
+        return None
+    post = (tx.get("meta", {}) or {}).get("postTokenBalances") or []
+    by_owner: dict[str, dict[str, float]] = {}
+    for b in post:
+        owner, m = b.get("owner"), b.get("mint")
+        if owner and m in (mint, WRAPPED_SOL_MINT):
+            amt = b.get("uiTokenAmount", {}).get("uiAmount") or 0.0
+            by_owner.setdefault(owner, {})[m] = amt
+    pairs = [
+        (d[mint], d[WRAPPED_SOL_MINT])
+        for d in by_owner.values()
+        if d.get(mint, 0) > 0 and d.get(WRAPPED_SOL_MINT, 0) > 0
+    ]
+    if not pairs:
+        return None
+    base, wsol = max(pairs, key=lambda x: x[0])  # pool = largest base holder
+    return wsol / base if base > 0 and wsol > 0 else None
+
+
+async def _fetch_pumpswap_price(mint: str, helius: HeliusClient) -> float | None:
+    """Best-effort PumpSwap spot price (SOL per whole token) for a graduated
+    token, read from the pool's on-chain reserves at the most recent swap.
+
+    Called at the migrate event, so the reserves it reads are the price *at
+    graduation* — exactly the exit price the broker needs (charter I2). Scans the
+    mint's recent signatures for the first PumpSwap tx and reads its pool
+    reserves. Returns None (caller falls back to the terminal price) on failure.
+    """
     try:
-        sigs = await helius._rpc(
-            "getSignaturesForAddress", [mint, {"limit": 5}]
-        )
-        for s in (sigs or []):
-            if s.get("err"):
-                continue
-            tx = await helius.get_transaction(s["signature"])
-            if not tx or "transaction" not in tx:
-                continue
-            # Look for a PumpSwap swap: token balance delta on the pool + SOL
-            # delta. The first swap after graduation gives the market price.
-            meta = tx.get("meta", {}) or {}
-            post_bal = meta.get("postTokenBalances") or []
-            pre_bal = meta.get("preTokenBalances") or []
-            for pb in post_bal:
-                if pb.get("mint") != mint:
-                    continue
-                idx = pb.get("accountIndex")
-                pre_match = next((b for b in pre_bal if b.get("accountIndex") == idx), None)
-                pre_amt = (pre_match or {}).get("uiTokenAmount", {}).get("uiAmount") or 0.0
-                post_amt = pb.get("uiTokenAmount", {}).get("uiAmount") or 0.0
-                token_delta = abs(post_amt - pre_amt)
-                if token_delta <= 0:
-                    continue
-                pre_sol = meta.get("preBalances") or []
-                post_sol = meta.get("postBalances") or []
-                if not pre_sol or not post_sol:
-                    continue
-                sol_delta = abs(post_sol[0] - pre_sol[0]) / 1e9
-                if sol_delta <= 0:
-                    continue
-                price = sol_delta / token_delta
-                return float(price) if price > 0 else None
+        sigs = await helius._rpc("getSignaturesForAddress", [mint, {"limit": 10}])
     except Exception:
         return None
+    for s in (sigs or []):
+        if s.get("err"):
+            continue
+        try:
+            tx = await helius.get_transaction(s["signature"])
+        except Exception:
+            continue
+        if not tx:
+            continue
+        price = _pool_price_from_tx(tx, mint)
+        if price is not None and price > 0:
+            return float(price)
     return None
 
 
@@ -354,7 +415,12 @@ async def run(
         use_logs_feed = True
         rpc_url = helius.url
         print("Helius RPC configured — using real bot classifier + on-chain reserves")
-        print("Trade data source: Helius logsSubscribe on the Pump program (every trade, no metered cost)")
+        if os.environ.get("HELIUS_CLASSIFY_TRADES", "").lower() in ("1", "true", "yes"):
+            print("Trade data source: Helius logsSubscribe + per-tx classification "
+                  "(getTransaction per trade — precise bot flag, higher credit use)")
+        else:
+            print("Trade data source: Helius logsSubscribe, trades decoded from the "
+                  "log event (no getTransaction per trade; bot flag via size heuristic)")
     else:
         print("HELIUS_API_KEY unset — using size heuristic bot flag + reconstructed vSol")
         print("Trade data source: PumpPortal free feed (creates only; no trades without a metered key)")
@@ -413,6 +479,8 @@ async def run(
         last_swaps_window = 0
         last_stats_ts = time.time()
         last_checkpoint_ts = time.time()
+        last_exit_check_ts = 0.0
+        last_feed_health_ts = time.time()
     stats = _Stats()
 
     def _vsol_for(mint: str, sw: Swap) -> float:
@@ -459,17 +527,24 @@ async def run(
             return True  # on error, don't exclude — score it
     _SOL_CONFIRMED: set[str] = set()
 
-    def _handle_swap(mint: str, sw: Swap, now: float) -> None:
+    def _handle_swap(mint: str, sw: Swap, now: float, source: str = "pumpportal") -> None:
         """Append + log + score + paper-trade a swap from either feed."""
         if mint in NON_SOL_MINTS:
             return  # USDC-paired; excluded from scoring/training
-        sw.vsol_after = _vsol_for(mint, sw)
+        # The Helius logs feed now decodes the true on-chain reserves straight
+        # from the trade event (sw.vsol_after > 0). Only reconstruct from history
+        # when we don't have a real value (PumpPortal feed, or RPC-fallback path).
+        if sw.vsol_after <= 0:
+            sw.vsol_after = _vsol_for(mint, sw)
         HISTORY[mint].append(sw)
-        store.log_swap(sw, mint)
+        store.log_swap(sw, mint, source=source)
         stats.n_swaps_total += 1
 
-        # Paper-trade exit checks on every event (cheap).
-        if broker is not None:
+        # Paper-trade exit checks, throttled (not per-swap): rebuilding the
+        # vsol map over all tracked mints on every event was O(mints)/swap and
+        # starved the event loop under load. Time/loss stops are coarse.
+        if broker is not None and now - stats.last_exit_check_ts >= CHECK_EXITS_EVERY_SEC:
+            stats.last_exit_check_ts = now
             vsol_by_mint = {m: h[-1].vsol_after for m, h in HISTORY.items() if h}
             closed = broker.check_exits(now, vsol_by_mint)
             for pos in closed:
@@ -554,7 +629,7 @@ async def run(
                             mint = evt.get("mint") or evt.get("token")
                             if mint:
                                 store.set_outcome(mint, "graduated", outcome_ts=now, graduated_at_ts=now)
-                                await _record_graduation_price(mint, now, helius, store)
+                                await _record_graduation_price(mint, now, helius, store, pc)
                         elif not use_logs_feed:
                             # No Helius — use PumpPortal trade events directly (metered tier).
                             mint = evt.get("mint") or evt.get("token") or evt.get("ca")
@@ -588,7 +663,11 @@ async def run(
     async def _helius_logs_feed() -> None:
         """Trade + migration events via Helius logsSubscribe on the Pump + PumpSwap programs."""
         assert helius is not None
-        feed = PumpLogsFeed(helius)
+        # Default: decode each trade straight from the log event (zero RPC per
+        # trade). Set HELIUS_CLASSIFY_TRADES=1 to restore the precise but
+        # credit-expensive per-tx instruction-stack bot classification.
+        classify = os.environ.get("HELIUS_CLASSIFY_TRADES", "").lower() in ("1", "true", "yes")
+        feed = PumpLogsFeed(helius, classify_trades=classify)
         async for evt in feed.stream():
             now = time.time()
             if evt[0] == "create":
@@ -607,7 +686,7 @@ async def run(
                 # backtest and paper broker value the exit at the real market
                 # price (charter I2), not a flat 5x placeholder. Non-blocking
                 # on failure — the broker falls back to the default multiple.
-                await _record_graduation_price(mint, now, helius, store)
+                await _record_graduation_price(mint, now, helius, store, pc)
                 if broker is not None and mint in broker.positions:
                     closed = broker.on_graduated(mint, now)
                     if closed:
@@ -651,7 +730,7 @@ async def run(
                                     is_buy=parsed["is_buy"], sol_amount=parsed["sol_amount"],
                                     vsol_after=0.0, via_frontend=parsed["via_frontend"],
                                 )
-                                _handle_swap(mint, sw, sw_ts)
+                                _handle_swap(mint, sw, sw_ts, source="helius")
 
                     await asyncio.gather(*(_backfill_one(m) for m in broker.positions))
                 continue
@@ -671,9 +750,18 @@ async def run(
                     continue
             elif mint in NON_SOL_MINTS:
                 continue
-            _handle_swap(mint, sw, now)
+            _handle_swap(mint, sw, now, source="helius")
             if int(now) % 30 == 0 or len(HISTORY) > MAX_TOKENS:
                 _gc(now, store, force=(len(HISTORY) > MAX_TOKENS))
+            # Periodic feed-health line: decode/fetch split (credit use) + drops
+            # (consumer falling behind the firehose). n_dropped > 0 growing means
+            # the consumer can't keep up — investigate before trusting the data.
+            if now - stats.last_feed_health_ts >= 60.0:
+                stats.last_feed_health_ts = now
+                import sys
+                print(f"[feed] decoded_from_log={feed.n_decoded_from_log} "
+                      f"fetched_rpc={feed.n_fetched} dropped={feed.n_dropped} "
+                      f"tracked_mints={len(HISTORY)}", file=sys.stderr, flush=True)
 
     print("connecting to live feeds...")
     try:
@@ -792,9 +880,12 @@ def _rescore_with_model(s: TokenScore, est: float, edge: float) -> TokenScore:
     immutable so the dashboard and the persisted DecisionEvent can't drift apart
     from the logged swap record).
     """
-    if edge > 0.03 and s.conviction_score >= 55 and s.bot_trade_share < 0.6:
+    # Gate purely on the calibrated model's edge (est - breakeven). The old
+    # conviction_score/bot_share filters here were inverted vs reality, so they're
+    # gone — the model carries those signals as features now.
+    if edge > ENTER_EDGE_MARGIN:
         decision = "ENTER"
-    elif edge > 0 and s.conviction_score >= 40:
+    elif edge > 0:
         decision = "WATCH"
     else:
         decision = "SKIP"
