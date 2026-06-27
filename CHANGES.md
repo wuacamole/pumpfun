@@ -222,3 +222,256 @@ All notable changes to the pumpfun conviction scoring system.
 ### Additional bug fix
 
 - Fixed `decode_global_account` minimum length check: was double-counting `authority` + `fee_recipient` (226 bytes), corrected to 162 bytes to match actual layout.
+
+## Duplicate-writer corruption fix (double-spawned monitor)
+
+### Root cause
+
+The harness launching `live_monitor.py` periodically double-spawns the
+process. The existing `_acquire_singleton_lock` (`fcntl.flock` on
+`/tmp/pumpfun_monitor_<hash>.lock`) guards one host, but the launcher
+re-parented the second instance in a way that bypassed the lock check in
+some restart paths. Two concurrent monitors each subscribe to the
+logsSubscribe firehose and log every on-chain trade, so the `swaps` table
+accumulated ~49% duplicate rows in recent windows. The corruption was
+invisible to `dedupe_swaps` because that method keyed on
+`(mint, ts, wallet, is_buy, sol_amount, vsol_after)` and the two monitors
+stamped **different** `ts` values: `helius.py` set `ts = time.time()`
+(receipt/dispatch time, since `logsSubscribe` carries no `blockTime`), so
+the same on-chain event produced two rows with different `ts` and survived
+the 6-col dedupe. Every per-token feature (`bot_trade_share`,
+`sol_per_human_wallet`, `net_sol_per_swap`, `n_swaps`) was then inflated,
+silently corrupting the training set.
+
+### Fix — three layers, defense in depth
+
+- **`helius.py` — on-chain block_time as `ts`.** `logsSubscribe` doesn't
+  carry `blockTime`, but the decoded `TradeEvent` embeds the program's own
+  unix timestamp (`block_time`). Both swap-emit paths (zero-RPC log-decode
+  and the `HELIUS_CLASSIFY_TRADES=1` RPC path) now stamp the `Swap` with
+  `float(te.block_time) when te.block_time else ts`. Two monitors logging
+  the same on-chain trade now produce an identical `ts`, so the existing
+  6-col dedupe collapses them. Falls back to receipt `time.time()` only
+  when the event didn't decode (PumpPortal / RPC-backfill paths).
+- **`storage.py` — `signature` column + partial unique index.** New
+  nullable `signature` column on `swaps` (the on-chain tx signature from
+  `logsSubscribe`). A partial unique index `ux_swaps_signature` rejects a
+  second insert of the same signature at insert time — so even if two
+  monitors somehow produce different `ts` (e.g. the block_time was None on
+  one path), the second insert is a silent no-op. `log_swap` /
+  `log_swaps` swallow the `IntegrityError` on a duplicate signature and
+  return; other `IntegrityError`s still propagate. SQLite treats NULL
+  signatures as distinct (no constraint), so signature-less rows
+  (PumpPortal feed) still rely on the 6-col dedupe. Migration adds the
+  column via `ALTER TABLE` and creates the index on existing DBs.
+- **`storage.py` — `dedupe_swaps` two-pass + startup run.** `dedupe_swaps`
+  now runs two passes inside one transaction: a signature pass first
+  (collapses any same-signature rows that pre-date the insert-time guard),
+  then the original 6-col event-key pass for signature-less rows. `Store`
+  calls `dedupe_swaps()` on every open (`contextlib.suppress(
+  OperationalError)` — a locked DB skips silently and heals on the
+  writer's next restart), so the store self-heals legacy corruption
+  without a manual maintenance step.
+
+### Wiring
+
+- `live_monitor.py:_handle_swap` accepts a `signature` kwarg and threads
+  it to `store.log_swap`. The logs-feed swap path (`_, sw, mint, sig =
+  evt`) and the gap-backfill path both pass the signature; the PumpPortal
+  path (no signature in the event) leaves it `None`.
+
+### Parquet
+
+- `swaps_<ts>.parquet` now includes `is_direct`, `entry_program`, and
+  `signature` columns (previously dropped). `_SWAPS_PARQUET_SCHEMA` and
+  the streaming writer updated.
+
+### Tests
+
+- `test_store_signature_guard_blocks_duplicate_insert` — the same
+  signature logged twice (different receipt `ts`) lands exactly once.
+- `test_store_dedupe_swaps_collapses_same_on_chain_trade_across_receipt_ts`
+  — two rows that agree on the 6-col key (incl. on-chain block_time) are
+  collapsed; pins the `ts = block_time` contract.
+- `test_store_signature_none_rows_fall_back_to_event_dedupe` — NULL-sig
+  rows are not blocked by the partial index but are still caught by the
+  6-col pass.
+- `test_store_dedupe_keeps_distinct_same_ts_swaps` (existing) still
+  passes — distinct genuine same-ts trades (different `vsol_after`) are
+  preserved.
+
+### Known limitation
+
+Legacy rows written before this fix have `signature = NULL` (the column
+didn't exist), so their receipt-time duplicates cannot be recovered via
+the signature pass. The 6-col pass still collapses the ~0.16% byte-
+identical dupes; the remaining receipt-time dupes in the legacy window
+must be excluded at analysis time (export a snapshot from a clean
+post-fix `ts` boundary). New data from this point forward is protected by
+all three layers.
+
+## Tier 1 backtest correctness fixes
+
+### #1 — no-model fold no longer ENTERs on the anti-predictive heuristic
+
+- **Root cause:** `run_backtest` fell back to `conviction_engine._estimate_graduation_prob`
+  on fold 0 (no fitted model yet) and on any fold where `fit` threw.
+  `validate_conviction.py` showed that heuristic is **anti-predictive**
+  (AUC 0.366 — worse than random; ENTER hits 5.6% vs a 28.6% base rate, i.e.
+  it systematically picks losers). The walk-forward was therefore seeding
+  `train_buf` with wrong ENTER labels that poisoned fold 1's fit.
+- **Fix:** the no-model fold now uses a **running base-rate prior**
+  (`n_grad_so_far / n_resolved_so_far`, seeded at 0.5) as `est_grad_prob`.
+  With a base-rate prior, `edge = est - brk ≈ 0`, so the ENTER gate (which
+  requires `edge > entry_edge_threshold > 0`) can't fire. ENTER is also
+  explicitly gated off when `model is None`. The no-model fold records
+  WATCH/SKIP only. The Brier/calibration metrics are no longer inverted by
+  the broken heuristic. The `_estimate_graduation_prob` import is removed
+  from `backtest.py`.
+- **Test:** `test_backtest_no_model_fold_records_no_enters`.
+
+### #2 — real loss-side exit prices (charter I2)
+
+- **Root cause:** `_realized_return` used a flat `default_loss_fraction=0.90`
+  for every non-graduation — a fiction that violates charter I2 (post-cost
+  realized PnL of the *actual* strategy) on the loss side. The paper broker
+  logs the real exit economics in `paper_trades`/`paper_fills`: stopped
+  trades average 0.40x entry, timed_out 0.96x. The backtest's
+  `enter_mean_return` (the number the §5.4 gate judges) was computed from
+  the 0.10x fiction, so it couldn't be compared to the broker's actual
+  realized returns — losses were overstated by up to ~25x for timed-out
+  trades.
+- **Fix:** `_realized_return` takes a `loss_multiple` (the real
+  `exit_sol / entry_sol` the broker logged at its stop/time-out) and uses
+  `mult * (1 - exit_cost) - (1 + entry_cost)` — symmetric with the
+  graduation path. Falls back to `default_loss_multiple=0.10` (the
+  rug-floor) only when no logged exit exists. New
+  `Store.stop_exit_multiples()` returns the per-mint real exit multiples;
+  `run_backtest` accepts a `stop_exit_multiples` map (parallel to
+  `graduation_prices`); `load_examples_from_store` returns a 3-tuple
+  `(examples, graduation_prices, stop_exit_multiples)`; `cli.py backtest`
+  threads it through.
+- **Test:** `test_realized_return_uses_real_loss_multiple`,
+  `test_store_stop_exit_multiples`.
+
+### #3 — `Store(auto_dedupe=False)` for analytical opens
+
+- **Root cause:** `Store.__init__` ran `dedupe_swaps()` on *every* open,
+  including read-only analytical opens (`backtest.load_examples_from_store`,
+  `base_rate`, `cli fit`/`export`). That triggered a full-table DELETE +
+  `n_swaps` recompute (O(rows), ~500k) for no reason, and on a live DB it
+  would mutate the writer's table out from under it.
+- **Fix:** new `auto_dedupe: bool = True` kwarg. The writer
+  (`live_monitor`) keeps the default so the store self-heals on restart.
+  Analytical opens pass `auto_dedupe=False` and skip the dedupe + the
+  `n_swaps` recompute entirely. Wired into `backtest.load_examples_from_store`,
+  `base_rate.BaseRateMonitor.snapshot`, `cli.cmd_fit`, `cli.cmd_export`.
+- **Test:** `test_store_auto_dedupe_false_skips_dedupe_on_open`.
+
+## Tier 2 — model quality improvements
+
+### #4 — creator-history index from existing data (Phase 2.2 wired)
+
+- **Data:** `tokens.created_meta` already carries `traderPublicKey` (the
+  creator) on all 25,618 tokens. 5,834 distinct creators; 1,609 have >1 token
+  (max 639 by one creator). No new data source was needed — the join was
+  always available, just not wired.
+- **`storage.py`:** new `Store.creator_of(mint)` extracts the creator from
+  `created_meta`; `Store.creator_history_index(as_of=)` builds a per-creator
+  `(n_graduated, n_non_graduated)` index from resolved token outcomes, with
+  no-lookahead (only outcomes with `outcome_ts <= as_of` count — a token that
+  graduated at ts=200 doesn't contribute to a token scored at ts=100).
+- **`backtest.py`:** `load_examples_from_store` now builds a
+  `CreatorHistory(creator_graduated_count, creator_rugged_count)` per token
+  from the creator's *prior* outcomes (before that token's first swap) and
+  passes it through the examples list. `top_holder_share` and
+  `smart_money_present` remain NaN (need a holder-snapshot source).
+- **`live_monitor.py`:** builds a `creator_index` cache at startup, refreshed
+  every 5 min on the `_gc` cycle; `_maybe_score` passes the mint's
+  `CreatorHistory` into `predict_grad_prob` via a `creator_lookup` callback.
+- **`storage.py:swaps_for`:** now reconstructs `is_direct` and
+  `entry_program` on the `Swap` objects (previously dropped), so the
+  backtest/refit paths get the new features.
+
+### #5 — `direct_call_share` + `n_entry_programs` features (Phase 2.2a)
+
+- **Root cause:** `is_direct` (the real instruction-stack bot flag — pump
+  invoked at top level = autonomous bot) and `entry_program` (the raw
+  top-level program driving the trade) are logged on every swap at zero RPC
+  cost but were not in `FEATURE_COLUMNS`. `validate_conviction.py` showed the
+  size-heuristic `via_frontend` proxy is **inverted vs reality** (humans
+  trade small, bots graduate); `direct_call_share` is the signal the paper
+  actually measured. Adding it is the single biggest unused-data leverage.
+- **`model.py`:** `FEATURE_COLUMNS` extended with `direct_call_share` and
+  `n_entry_programs` (appended at the end so existing saved models stay
+  loadable — the imputer fills NaN for columns a model was trained without).
+  `featurize` computes them from `Swap.is_direct` / `Swap.entry_program`;
+  NaN when the feed didn't carry them (PumpPortal/RPC-backfill paths).
+
+### #6 — time-ordered expanding-window CV in `refit_model.py`
+
+- **Root cause:** `group_cv` used `GroupKFold` (no per-token leakage) but
+  folds were random in time — a token from today could train a model that
+  "predicts" a token from last week. The live system only ever predicts the
+  future, so random-time OOS metrics over-estimate live performance. The
+  saved `latest.pkl` was optimistically calibrated.
+- **Fix:** new `time_ordered_cv` sorts mints by first-appearance rank
+  (chronological), splits into `n_splits` contiguous time folds, and for
+  fold `k` trains on folds `0..k-1` (earlier mints) testing on fold `k`.
+  Fold 0 (no training data) is excluded — same contract as the walk-forward
+  backtest's no-model fold. `main()` now reports both the random-GroupKFold
+  (optimistic upper bound) and the time-ordered CV (honest metric) and
+  picks the model on the time-ordered AUC.
+- **`refit_model._load_tokens`:** now reads `is_direct` and `entry_program`
+  from the DB so the new features populate in the refit frame.
+
+### #7 — Platt (logistic) calibration below 1000 positives
+
+- **Root cause:** `fit` used isotonic regression for calibration. Isotonic is
+  non-parametric (a step function fit to the data) and overfits the
+  calibration curve when positives are scarce — the in-sample Brier 0.0236
+  is suspiciously low for a 28.6%-base-rate problem with 423 positives, a
+  symptom of isotonic overfitting the calibration step.
+- **Fix:** `fit` now chooses `method="sigmoid"` (Platt — parametric, 2
+  parameters: slope + intercept) when `n_positives < 1000`, and
+  `method="isotonic"` only once the positive class is large enough for the
+  step function to be well-constrained. Charter §5.2 allows either method.
+
+## Tier 3 — reproducibility & audit
+
+### `--min-first-seen-ts` flag for the clean-window backtest
+
+- **Problem:** the gate-relevant clean-window backtests (DECISIONS runs #6/#7
+  — pre-dedup-fix contaminated tokens excluded) were run via ad-hoc in-memory
+  filter scripts because `load_examples_from_store` only had a
+  `holdout_start_ts` (which *excludes* recent tokens), not a post-fix *floor*.
+  That violated CHARTER §9.2: the runs that decide the §5.4 gate weren't
+  reproducible and weren't auto-logged/counted.
+- **Fix:** added a `min_first_seen_ts` parameter to `load_examples_from_store`
+  (excludes tokens whose first swap ts is below the floor) and a
+  `--min-first-seen-ts` flag to `cli.py backtest`. The clean-window run is now
+  a first-class CLI command that auto-logs to DECISIONS.md and increments
+  `backtest_runs_to_date`. The floor is also recorded in the run config.
+- Run #6 (cli, reproducible): n_tokens=1346, ENTER hit 32.1% vs 10.9% base
+  (2.9x lift), +111.2% mean return, reliability slope 0.857 (now in the
+  [0.8,1.2] band), bootstrap CI low +76.2%, jackknife positive, fold stable.
+  4 of 5 §5.4 criteria pass; n_grad_in_enter=25 (<30) is the lone blocker.
+
+### Dead-feature cleanup — `smart_money_present` dropped, `top_holder_share` measured
+
+- **`smart_money_present`:** removed. It was 100% NaN (no data source) and a
+  curated "profitable wallet" set would be target leakage if labelled from
+  outcomes. Pure imputation noise + false completeness — gone from
+  `FEATURE_COLUMNS`, `CreatorHistory`, and `featurize`.
+- **`top_holder_share`:** was 100% NaN; now **reconstructed as-of from the swap
+  stream** in `model.featurize` (zero new RPC) — per swap, token amount inferred
+  from `sol_amount / curve_price_per_token(vsol_after)`, summed per wallet
+  (buys add / sells subtract / negatives clamped), share = max / total. No
+  lookahead (only `ts <= as_of`).
+- **Measured, then excluded from the active set.** Univariate AUC 0.667
+  (graduates less concentrated: median 0.44 vs 0.73). But a controlled A/B on
+  identical data shows ~0 marginal OOS AUC (±0.005–0.009; slightly negative for
+  gbm) — the signal is redundant with `n_unique_wallets` /
+  `sol_per_human_wallet` / `bot_trade_share`. Per the "must prove OOS lift"
+  rule it's kept computed (tested, documented) but not in `FEATURE_COLUMNS`.
+- Model refit on the cleaned 15-feature set (auto-selected gbm). See DECISIONS.md.

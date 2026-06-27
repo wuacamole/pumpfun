@@ -759,8 +759,17 @@ class PumpLogsFeed:
                                 if te is None:
                                     continue
                                 self.n_decoded_from_log += 1
+                                # Stamp the swap with the TradeEvent's on-chain
+                                # block_time when present, falling back to the
+                                # receipt ts. logsSubscribe delivers logs in the
+                                # notification (no blockTime), but the decoded
+                                # TradeEvent embeds the program's own unix ts;
+                                # using it makes the swap key stable across
+                                # concurrent monitors, so dedupe_swaps collapses
+                                # double-logged trades regardless of receipt time.
+                                swap_ts = float(te.block_time) if te.block_time else ts
                                 swap = Swap(
-                                    ts=ts,
+                                    ts=swap_ts,
                                     wallet=te.trader,
                                     is_buy=te.is_buy,
                                     sol_amount=te.sol_amount,
@@ -786,8 +795,13 @@ class PumpLogsFeed:
                             if parsed is None:
                                 continue
                             self.n_fetched += 1
+                            # Prefer the TradeEvent's on-chain block_time so two
+                            # concurrent monitors produce an identical swap key
+                            # (see the zero-RPC path above); fall back to the
+                            # receipt ts only when the log didn't decode.
+                            swap_ts = float(te.block_time) if te is not None and te.block_time else ts
                             swap = Swap(
-                                ts=ts,
+                                ts=swap_ts,
                                 wallet=parsed["trader"],
                                 is_buy=parsed["is_buy"],
                                 sol_amount=parsed["sol_amount"],

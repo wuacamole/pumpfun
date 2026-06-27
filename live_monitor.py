@@ -37,6 +37,7 @@ import math
 import os
 import time
 from collections import defaultdict
+from collections.abc import Callable
 from typing import Any
 
 from dotenv import load_dotenv
@@ -60,7 +61,7 @@ from conviction_engine import (  # noqa: E402
     score_token,
 )
 from helius import HeliusClient, PumpLogsFeed  # noqa: E402
-from model import FittedModel, ModelStore, predict_grad_prob  # noqa: E402
+from model import CreatorHistory, FittedModel, ModelStore, predict_grad_prob  # noqa: E402
 from monitor import AlertStream, Dashboard, DecisionEvent, OpenPositionView, PnlEvent  # noqa: E402
 from paper_trade import PaperBroker  # noqa: E402
 from storage import Store  # noqa: E402
@@ -472,6 +473,42 @@ async def run(
         dash_ctx = dash.live()
         dash_ctx.__enter__()
 
+    # Phase 2.2 creator-history index — {creator: (n_graduated, n_non_graduated)}
+    # built from resolved token outcomes. Refreshed on each _gc cycle (the
+    # natural maintenance point) so newly-resolved outcomes propagate. Used by
+    # _maybe_score to pass CreatorHistory into predict_grad_prob; the model
+    # carries creator_graduated_count / creator_rugged_count as features.
+    creator_index: dict[str, tuple[int, int]] = {}
+    last_creator_index_ts = 0.0
+
+    def _refresh_creator_index(now: float) -> None:
+        nonlocal creator_index, last_creator_index_ts
+        # Refresh at most every 5 min — the index is a full scan over resolved
+        # tokens and doesn't change token-to-token.
+        if now - last_creator_index_ts < 300.0 and creator_index:
+            return
+        try:
+            creator_index = store.creator_history_index()
+            last_creator_index_ts = now
+        except Exception:
+            pass  # non-blocking — features fall back to NaN
+
+    def _creator_history_for(mint: str) -> CreatorHistory | None:
+        """No-lookahead creator history for a live-scored mint. In the live
+        case ``as_of = now``, so every resolved outcome counts."""
+        creator = store.creator_of(mint)
+        if not creator or creator not in creator_index:
+            return None
+        g, n = creator_index[creator]
+        if g == 0 and n == 0:
+            return None
+        return CreatorHistory(
+            creator_graduated_count=float(g),
+            creator_rugged_count=float(n),
+        )
+
+    _refresh_creator_index(time.time())
+
     # Counters for the feed-stats panel.
     class _Stats:
         n_tokens_seen = 0
@@ -527,8 +564,16 @@ async def run(
             return True  # on error, don't exclude — score it
     _SOL_CONFIRMED: set[str] = set()
 
-    def _handle_swap(mint: str, sw: Swap, now: float, source: str = "pumpportal") -> None:
-        """Append + log + score + paper-trade a swap from either feed."""
+    def _handle_swap(mint: str, sw: Swap, now: float, source: str = "pumpportal",
+                     signature: str | None = None) -> None:
+        """Append + log + score + paper-trade a swap from either feed.
+
+        ``signature`` is the on-chain tx signature from the logs feed (None
+        when the feed doesn't carry one). It backs the insert-time duplicate
+        guard in :meth:`Store.log_swap`, so a second concurrent monitor
+        logging the same on-chain trade is a silent no-op rather than a
+        duplicate row.
+        """
         if mint in NON_SOL_MINTS:
             return  # USDC-paired; excluded from scoring/training
         # The Helius logs feed now decodes the true on-chain reserves straight
@@ -537,7 +582,7 @@ async def run(
         if sw.vsol_after <= 0:
             sw.vsol_after = _vsol_for(mint, sw)
         HISTORY[mint].append(sw)
-        store.log_swap(sw, mint, source=source)
+        store.log_swap(sw, mint, source=source, signature=signature)
         stats.n_swaps_total += 1
 
         # Paper-trade exit checks, throttled (not per-swap): rebuilding the
@@ -579,7 +624,8 @@ async def run(
             store.checkpoint()
             stats.last_checkpoint_ts = now
 
-        _maybe_score(mint, now, store, fitted, broker, alert, dash, dashboard)
+        _maybe_score(mint, now, store, fitted, broker, alert, dash, dashboard,
+                     creator_lookup=_creator_history_for)
 
     # ------------------------------------------------------------------ PumpPortal
     # PumpPortal gives us create events (token discovery + metadata) for free.
@@ -730,12 +776,12 @@ async def run(
                                     is_buy=parsed["is_buy"], sol_amount=parsed["sol_amount"],
                                     vsol_after=0.0, via_frontend=parsed["via_frontend"],
                                 )
-                                _handle_swap(mint, sw, sw_ts, source="helius")
+                                _handle_swap(mint, sw, sw_ts, source="helius", signature=sig)
 
                     await asyncio.gather(*(_backfill_one(m) for m in broker.positions))
                 continue
             # swap
-            _, sw, mint, _sig = evt
+            _, sw, mint, sig = evt
             if mint not in LAUNCH_TS:
                 # First time we see this mint — register it (logs feed may see
                 # trades before PumpPortal's create event arrives).
@@ -750,9 +796,10 @@ async def run(
                     continue
             elif mint in NON_SOL_MINTS:
                 continue
-            _handle_swap(mint, sw, now, source="helius")
+            _handle_swap(mint, sw, now, source="helius", signature=sig)
             if int(now) % 30 == 0 or len(HISTORY) > MAX_TOKENS:
                 _gc(now, store, force=(len(HISTORY) > MAX_TOKENS))
+                _refresh_creator_index(now)
             # Periodic feed-health line: decode/fetch split (credit use) + drops
             # (consumer falling behind the firehose). n_dropped > 0 growing means
             # the consumer can't keep up — investigate before trusting the data.
@@ -823,6 +870,7 @@ def _maybe_score(
     alert: AlertStream,
     dash: Dashboard,
     quiet: bool = False,
+    creator_lookup: Callable[[str], CreatorHistory | None] | None = None,
 ) -> None:
     if len(HISTORY[mint]) < MIN_SWAPS_TO_SCORE:
         return
@@ -838,7 +886,8 @@ def _maybe_score(
     # hand-built estimate baked into the TokenScore stands.
     if fitted is not None:
         try:
-            est = predict_grad_prob(fitted, swaps)
+            creator = creator_lookup(mint) if creator_lookup is not None else None
+            est = predict_grad_prob(fitted, swaps, creator=creator)
             brk = _breakeven_probability(s.vsol)
             edge = est - brk
             s = _rescore_with_model(s, est, edge)
@@ -898,6 +947,33 @@ def _rescore_with_model(s: TokenScore, est: float, edge: float) -> TokenScore:
     )
 
 
+def _acquire_singleton_lock(db_path: str):
+    """Refuse to start if another monitor is already running for this DB.
+
+    Two concurrent monitors each subscribe to the feed and log every trade, so the
+    swaps table gets ~50% duplicate rows (different receipt ts, same on-chain
+    trade), corrupting every per-token feature. An exclusive, non-blocking flock
+    held for the process lifetime guarantees exactly one writer regardless of how
+    the process is launched (the harness can double-spawn a backgrounded command).
+    Returns the held fd (keep it alive); exits the process if the lock is taken.
+    """
+    import fcntl
+    import hashlib
+    import sys
+    key = hashlib.md5(os.path.abspath(db_path).encode()).hexdigest()[:12]
+    lock_path = f"/tmp/pumpfun_monitor_{key}.lock"
+    fd = open(lock_path, "w")
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print(f"another live_monitor is already running for {db_path}; exiting",
+              file=sys.stderr, flush=True)
+        sys.exit(0)
+    fd.write(str(os.getpid()))
+    fd.flush()
+    return fd
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Pump.fun conviction live monitor")
     ap.add_argument("--paper", action="store_true", help="paper-trade ENTER signals")
@@ -905,6 +981,8 @@ def main() -> None:
     ap.add_argument("--db", default=os.environ.get("PUMPFUN_DB", "pumpfun.db"))
     ap.add_argument("--model", default="latest", help="fitted model name (models/<name>.pkl)")
     args = ap.parse_args()
+    # Singleton guard: prevents the duplicate-writer corruption described above.
+    _singleton_fd = _acquire_singleton_lock(args.db)  # noqa: F841 - held for lifetime
     try:
         asyncio.run(run(paper=args.paper, dashboard=args.dashboard, db_path=args.db, model_name=args.model))
     except KeyboardInterrupt:

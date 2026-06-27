@@ -59,7 +59,7 @@ class BaseRateMonitor:
     def snapshot(self, store_db: str | Path, now: float) -> BaseRateSnapshot:
         """Compute the current base rate over the trailing window."""
         from storage import Store
-        s = Store(store_db)
+        s = Store(store_db, auto_dedupe=False)
         try:
             cutoff = now - self.window_sec
             rows = s.conn.execute(

@@ -52,7 +52,6 @@ from config import curve_price_per_token, fee_at
 from conviction_engine import (
     Swap,
     _breakeven_probability,
-    _estimate_graduation_prob,
     _graduation_vsol,
     score_token,
 )
@@ -180,23 +179,31 @@ def _realized_return(
     exit_cost: float,
     payoff_multiple: float | None = None,
     default_graduation_multiple: float = 5.0,
-    default_loss_fraction: float = 0.90,
+    loss_multiple: float | None = None,
+    default_loss_multiple: float = 0.10,
 ) -> float:
     """Post-cost realized return for one trade.
 
     Graduation payoff: the real PumpSwap first-trade price multiple when logged
     (charter I2 — post-cost realized PnL of the *actual* strategy), else the
     conservative flat ``default_graduation_multiple`` (5x), the
-    pre-data-collection placeholder. Non-graduation: a conservative flat loss
-    (``default_loss_fraction``) until real exit-price data is logged.
+    pre-data-collection placeholder.
 
-    ``payoff_multiple`` is the exit-value multiple on the entry SOL (e.g. 5.0
-    means the position was worth 5x entry at graduation). When None, the default
-    is used. This is a *rough* proxy for non-graduations — replace with realized
-    exit-price data from the log once available.
+    Non-graduation: ``loss_multiple`` is the exit-value multiple on the entry
+    SOL (e.g. 0.40 = the stop sold the position for 40% of entry). When the
+    paper broker logged a real stop/time-out fill, pass ``exit_sol / entry_sol``
+    here (charter I2 — the loss side must also be the actual strategy's
+    realized PnL, not a fiction). Falls back to ``default_loss_multiple`` (0.10,
+    the rug-floor) only when no logged exit exists. The return is symmetric
+    with the graduation path: ``mult * (1 - exit_cost) - (1 + entry_cost)``.
+
+    ``exit_cost`` is the fee+slippage fraction at the exit side — curve fee for
+    a bonding-curve stop, PumpSwap fee for a graduation. ``entry_cost`` is the
+    fee+slippage+MEV fraction paid at entry.
     """
     if not graduated:
-        return -(default_loss_fraction + entry_cost)
+        mult = loss_multiple if loss_multiple is not None and loss_multiple >= 0 else default_loss_multiple
+        return mult * (1.0 - exit_cost) - (1.0 + entry_cost)
     mult = payoff_multiple if payoff_multiple is not None and payoff_multiple > 0 else default_graduation_multiple
     return mult * (1.0 - exit_cost) - (1.0 + entry_cost)
 
@@ -222,6 +229,8 @@ def run_backtest(
     entry_score_threshold: float = 55.0,
     entry_bot_share_max: float = 0.6,
     graduation_prices: dict[str, dict[str, object]] | None = None,
+    stop_exit_multiples: dict[str, dict[str, object]] | None = None,
+    max_decisions_per_token: int = 100,
 ) -> BacktestReport:
     """Walk-forward backtest.
 
@@ -231,13 +240,21 @@ def run_backtest(
     ``graduation_prices``: optional map of mint -> graduation-price row (from
     ``Store.all_graduation_prices``). When present, the graduation payoff uses
     the real PumpSwap first-trade multiple instead of the flat 5x placeholder
-    (charter I2). Tokens missing from the map fall back to the default.
+    (charter I2 — win side). Tokens missing from the map fall back to the default.
+
+    ``stop_exit_multiples``: optional map of mint -> stop-exit row (from
+    ``Store.stop_exit_multiples``). When present, a non-graduation trade's
+    realized return uses the real ``exit_sol / entry_sol`` multiple the paper
+    broker logged at its stop/time-out, instead of the flat rug-floor default
+    (charter I2 — loss side). The row carries ``status`` ("stopped"|"timed_out")
+    and ``exit_multiple``. Tokens missing from the map fall back to the default.
 
     For each token we make a decision at ``t0 + k*decision_every_sec`` while
     the token is still live and un-graduated. Only the *first* ENTER is tracked
     as a trade (one position per token).
     """
     gp = graduation_prices or {}
+    sm = stop_exit_multiples or {}
     # Sort tokens by launch ts so the walk-forward is chronological.
     items = []
     for mint, swaps, label, creator in examples:
@@ -251,6 +268,16 @@ def run_backtest(
     model: FittedModel | None = None
     trades: list[TradeOutcome] = []
     edge_over_time: list[float] = []
+    # Running base rate of graduation among tokens resolved so far. Used as the
+    # no-model prior instead of the hand-built _estimate_graduation_prob, which
+    # validate_conviction.py showed is anti-predictive (AUC 0.366 — ENTER hits
+    # 5.6% vs a 28.6% base rate, i.e. it picks losers). Seeding the walk-forward
+    # with that heuristic meant fold-0 ENTER decisions were systematically wrong
+    # AND those wrong labels poisoned train_buf for fold 1. The base-rate prior
+    # is neutral (edge ≈ 0 vs breakeven) so the no-model fold records no ENTERs
+    # and the Brier/calibration metrics aren't inverted by a broken heuristic.
+    n_grad_so_far = 0
+    n_resolved_so_far = 0
 
     for mint, swaps, label, creator in items:
         graduated, _ = _resolve_outcome(swaps, label)
@@ -259,31 +286,38 @@ def run_backtest(
         # Decision points while the token is still pre-graduation.
         k = 1
         entered = False
+        n_decisions_this_token = 0
         while True:
             as_of = t0 + k * decision_every_sec
             if as_of > last_ts or (swaps[-1].vsol_after >= _graduation_vsol() and as_of > swaps[-1].ts):
                 break
+            # Cap decisions per token: tokens that live for hours produce
+            # thousands of 30-sec decision points (the worst is ~2000), each
+            # calling featurize + score_token — O(n_swaps) — which makes the
+            # walk-forward O(tokens × max_points × max_swaps) and stalls past
+            # ~10 min. The decision doesn't change meaningfully after the
+            # entry window (~50 min = 100 points at 30s); cap it.
+            if n_decisions_this_token >= max_decisions_per_token:
+                break
+            n_decisions_this_token += 1
             seen = [s for s in swaps if s.ts <= as_of]
             if len(seen) < 5:
                 k += 1
                 continue
 
-            # Model or hand-built fallback for the graduation probability.
+            # Model or base-rate prior for the graduation probability.
             if model is not None:
                 feats = featurize(swaps, as_of=as_of, creator=creator)
                 est = model.predict_one(feats)
             else:
-                # Hand-built estimate — same path the live monitor uses today.
-                snap = seen
-                vsol = snap[-1].vsol_after
-                bot_share = sum(1 for s in snap if not s.via_frontend) / len(snap)
-                human_w = {s.wallet for s in snap if s.via_frontend}
-                n_human = len(human_w)
-                human_net = sum(s.sol_amount if s.is_buy else -s.sol_amount for s in snap if s.via_frontend)
-                sph = human_net / n_human if n_human else 0.0
-                net_sol = sum(s.sol_amount if s.is_buy else -s.sol_amount for s in snap)
-                nps = net_sol / len(snap)
-                est = _estimate_graduation_prob(vsol, bot_share, sph, nps, as_of - t0)
+                # No fitted model yet (fold 0, or a fit threw). Use the running
+                # base rate as a neutral prior — NOT the hand-built heuristic,
+                # which is anti-predictive (see validate_conviction.py). With a
+                # base-rate prior, edge = est - brk ≈ 0 so the ENTER gate (which
+                # requires edge > entry_edge_threshold > 0) never fires on the
+                # no-model fold. This keeps fold 0 from betting on a broken
+                # heuristic and from seeding train_buf with wrong ENTER labels.
+                est = (n_grad_so_far / n_resolved_so_far) if n_resolved_so_far else 0.5
 
             vsol = seen[-1].vsol_after
             brk = _breakeven_probability(vsol)
@@ -293,7 +327,12 @@ def run_backtest(
             score = tok.conviction_score
             bot_share = tok.bot_trade_share
 
-            if edge > entry_edge_threshold and score >= entry_score_threshold and bot_share < entry_bot_share_max:
+            # ENTER is gated off when no fitted model exists: the base-rate prior
+            # can't clear edge > entry_edge_threshold, and we deliberately don't
+            # fall back to the conviction_score/bot_share filters because
+            # validate_conviction.py showed they're inverted vs reality. The
+            # no-model fold records WATCH/SKIP only.
+            if model is not None and edge > entry_edge_threshold and score >= entry_score_threshold and bot_share < entry_bot_share_max:
                 decision = "ENTER"
                 entered = True
             elif edge > 0 and score >= 40:
@@ -302,11 +341,12 @@ def run_backtest(
                 decision = "SKIP"
 
             # Resolve the graduation payoff multiple from logged PumpSwap
-            # prices when available (charter I2). Per-position exact: the real
-            # exit price over this trade's bonding-curve entry price (the vSol at
-            # the ENTER decision). Falls back to the row's representative multiple,
-            # then to the default 5x. Only meaningful on the entry row (the loop
-            # breaks once entered), where ``vsol`` is the entry vSol.
+            # prices when available (charter I2, win side). Per-position exact:
+            # the real exit price over this trade's bonding-curve entry price
+            # (the vSol at the ENTER decision). Falls back to the row's
+            # representative multiple, then to the default 5x. Only meaningful on
+            # the entry row (the loop breaks once entered), where ``vsol`` is
+            # the entry vSol.
             payoff_mult = None
             if entered and graduated and mint in gp:
                 row = gp[mint]
@@ -319,6 +359,18 @@ def run_backtest(
                     pm = row.get("payoff_multiple")
                     if isinstance(pm, (int, float)) and pm > 0:
                         payoff_mult = float(pm)
+            # Resolve the loss-side exit multiple from the paper broker's logged
+            # stop/time-out fill (charter I2, loss side). When the broker closed
+            # a real position for this mint, exit_sol/entry_sol is the actual
+            # realized fraction — far less pessimistic than the flat rug-floor
+            # default (timed_out avg 0.96, stopped avg 0.40). Falls back to the
+            # default only when no logged exit exists.
+            loss_mult = None
+            if entered and not graduated and mint in sm:
+                srow = sm[mint]
+                em = srow.get("exit_multiple")
+                if isinstance(em, (int, float)) and em >= 0:
+                    loss_mult = float(em)
             trades.append(TradeOutcome(
                 mint=mint, as_of_ts=as_of, decision=decision,
                 est_grad_prob=est, breakeven_prob=brk, edge=edge,
@@ -328,6 +380,7 @@ def run_backtest(
                     fee_at(as_of).entry_cost(),
                     fee_at(as_of).exit_cost_pumpswap() if graduated else fee_at(as_of).exit_cost_curve(),
                     payoff_multiple=payoff_mult,
+                    loss_multiple=loss_mult,
                 )),
                 graduated=graduated, seconds_to_graduation=(as_of - t0 if graduated else None),
             ))
@@ -340,11 +393,21 @@ def run_backtest(
         # which is what the model will see live — not the final state.
         decision_as_of = trades[-1].as_of_ts if trades and trades[-1].mint == mint else last_ts
         train_buf.append((mint, swaps, graduated, creator, decision_as_of))
+        # Update the running base-rate prior for the next no-model fallback.
+        n_resolved_so_far += 1
+        if graduated:
+            n_grad_so_far += 1
         if len(train_buf) >= fold_size and len(train_buf) % fold_size == 0:
             df = build_training_frame(train_buf)
             if not df.empty and df["graduated"].nunique() == 2:
                 try:
-                    model = fit(df, kind=model_kind)
+                    # calibrate=False: the walk-forward evaluates discrimination
+                    # (AUC, hit rate), not calibration. CalibratedClassifierCV
+                    # with internal CV=3 makes each predict_one ~25ms and growing
+                    # (memory churn from per-call DataFrame allocation), which
+                    # stalls the backtest past a few hundred tokens. The §5.4
+                    # gate uses the saved calibrated model's metrics, not these.
+                    model = fit(df, kind=model_kind, calibrate=False)
                 except Exception as e:
                     import sys
                     print(f"  [warn] model fit failed at fold {len(train_buf)}: {e}",
@@ -466,37 +529,91 @@ def load_examples_from_store(
     store_db: str | Path,
     *,
     holdout_start_ts: float | None = None,
+    min_first_seen_ts: float | None = None,
 ) -> tuple[
     list[tuple[str, list[Swap], str, CreatorHistory | None]],
+    dict[str, dict[str, object]],
     dict[str, dict[str, object]],
 ]:
     """Pull all labelled tokens out of the SQLite store as backtest examples.
 
-    Returns ``(examples, graduation_prices)``. The graduation_prices map is
-    keyed by mint and used by :func:`run_backtest` to value graduation exits at
-    the real PumpSwap first-trade price (charter I2). Empty until tokens start
-    graduating on the live feed and their prices get logged.
+    Returns ``(examples, graduation_prices, stop_exit_multiples)``.
+    ``graduation_prices`` is keyed by mint and used by :func:`run_backtest` to
+    value graduation exits at the real PumpSwap first-trade price (charter I2,
+    win side). ``stop_exit_multiples`` is keyed by mint and used to value
+    non-graduation exits at the real ``exit_sol/entry_sol`` the paper broker
+    logged at its stop/time-out (charter I2, loss side). Both are empty until
+    the relevant data is logged.
 
-    Phase 2.2 creator features aren't wired here (we don't have the creator
-    index yet) — they're returned as None and the model handles NaN. Add the
-    creator-history join once you start logging creator addresses.
+    Phase 2.2 creator features are wired here via :meth:`Store.creator_history_index`
+    — each example carries a :class:`CreatorHistory` built from the creator's
+    *prior* outcomes (no lookahead: only outcomes known before this token's
+    first swap ts count). ``top_holder_share`` is reconstructed as-of inside
+    :func:`model.featurize` from the swap stream itself (no holder snapshot
+    needed); ``smart_money_present`` was dropped (see DECISIONS.md).
 
     ``holdout_start_ts``: when set, tokens whose first swap ts is >= this value
     are *excluded* — they belong to the locked holdout (charter §9.1) and must
     not enter training/selection. This is the fence that prevents the holdout
     from being consumed silently. The §5.4 gate evaluates on those tokens via a
     separate, single-shot command.
+
+    ``min_first_seen_ts``: when set, tokens whose first swap ts is < this value
+    are *excluded*. This is the post-dedup-fix floor used by the clean-window
+    backtest (DECISIONS runs #6/#7) — pre-fix tokens carry receipt-time-
+    duplicated swaps that inflate per-token features and must not be cited as
+    gate evidence. Replaces the ad-hoc in-memory filter scripts those runs used.
     """
+    from model import CreatorHistory
     from storage import Store
-    s = Store(store_db)
+    s = Store(store_db, auto_dedupe=False)
     examples: list[tuple[str, list[Swap], str, CreatorHistory | None]] = []
+    # Build the full creator-history index once; we'll filter per-token by the
+    # creator's outcomes known before that token's launch. Doing one query per
+    # token would be O(tokens) RPCs; this is one scan + an in-memory lookup.
+    # The index maps creator -> {outcome_ts: outcome} for resolved tokens, so
+    # we can count prior outcomes per-token without re-querying.
+    creator_outcomes: dict[str, list[tuple[float, str]]] = {}
+    rows = s.conn.execute(
+        """SELECT json_extract(created_meta, '$.traderPublicKey') AS creator,
+                  outcome_ts, outcome
+           FROM tokens
+           WHERE created_meta IS NOT NULL
+             AND outcome IN ('graduated', 'stalled', 'rugged')
+             AND outcome_ts IS NOT NULL"""
+    ).fetchall()
+    for r in rows:
+        creator = r["creator"]
+        if creator:
+            creator_outcomes.setdefault(creator, []).append(
+                (float(r["outcome_ts"]), r["outcome"])
+            )
     for mint, outcome in s.labelled_mints():
         swaps = s.swaps_for(mint)
         if not swaps:
             continue
         if holdout_start_ts is not None and swaps[0].ts >= holdout_start_ts:
             continue  # holdout — not for training/selection
-        examples.append((mint, swaps, outcome, None))
+        if min_first_seen_ts is not None and swaps[0].ts < min_first_seen_ts:
+            continue  # pre-fix contaminated window — exclude from clean run
+        # No-lookahead creator history: count this creator's resolved outcomes
+        # whose outcome_ts precedes this token's first swap. A creator whose
+        # earlier token graduated at ts=200 must not contribute to a token
+        # launched at ts=100.
+        creator = s.creator_of(mint)
+        ch: CreatorHistory | None = None
+        if creator and creator in creator_outcomes:
+            launch_ts = swaps[0].ts
+            prior = [(ts, o) for ts, o in creator_outcomes[creator] if ts <= launch_ts]
+            if prior:
+                n_grad = sum(1 for _, o in prior if o == "graduated")
+                n_non = len(prior) - n_grad
+                ch = CreatorHistory(
+                    creator_graduated_count=float(n_grad),
+                    creator_rugged_count=float(n_non),
+                )
+        examples.append((mint, swaps, outcome, ch))
     graduation_prices = s.all_graduation_prices()
+    stop_multiples = s.stop_exit_multiples()
     s.close()
-    return examples, graduation_prices
+    return examples, graduation_prices, stop_multiples

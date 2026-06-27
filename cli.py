@@ -35,7 +35,10 @@ def cmd_backtest(args: argparse.Namespace) -> int:
     if args.holdout_eval:
         print("WARNING: --holdout-eval consumes the locked holdout (charter §9.1). "
               "This is a single-shot evaluation; re-running voids the pre-registration.")
-    examples, graduation_prices = load_examples_from_store(args.db, holdout_start_ts=holdout)
+    examples, graduation_prices, stop_exit_multiples = load_examples_from_store(
+        args.db, holdout_start_ts=holdout,
+        min_first_seen_ts=args.min_first_seen_ts,
+    )
     if not examples:
         print(f"no labelled tokens in {args.db} — collect data first")
         return 1
@@ -44,6 +47,7 @@ def cmd_backtest(args: argparse.Namespace) -> int:
         "fold_size": args.fold_size,
         "kind": args.kind,
         "n_examples": len(examples),
+        "min_first_seen_ts": args.min_first_seen_ts,
     }
     run_num = record_backtest_run(config)
     print(f"running walk-forward backtest on {len(examples)} labelled tokens...")
@@ -55,6 +59,7 @@ def cmd_backtest(args: argparse.Namespace) -> int:
         fold_size=args.fold_size,
         model_kind=args.kind,
         graduation_prices=graduation_prices,
+        stop_exit_multiples=stop_exit_multiples,
     )
     out = write_report(report, args.out)
     print("\n=== backtest report ===")
@@ -97,7 +102,7 @@ def cmd_backtest(args: argparse.Namespace) -> int:
 
 
 def cmd_fit(args: argparse.Namespace) -> int:
-    store = Store(args.db)
+    store = Store(args.db, auto_dedupe=False)
     labelled = store.labelled_mints()
     if not labelled:
         print(f"no labelled tokens in {args.db} — collect data first")
@@ -126,7 +131,7 @@ def cmd_fit(args: argparse.Namespace) -> int:
 
 
 def cmd_export(args: argparse.Namespace) -> int:
-    store = Store(args.db)
+    store = Store(args.db, auto_dedupe=False)
     p = store.export_parquet(args.out_dir)
     print(f"snapshot written: {p}")
     # Optional retention: now that the full history is captured in the immutable
@@ -153,6 +158,12 @@ def main() -> None:
     b.add_argument("--decision-every", type=float, default=30.0)
     b.add_argument("--fold-size", type=int, default=50)
     b.add_argument("--kind", default="gbm", choices=["gbm", "logistic"])
+    b.add_argument(
+        "--min-first-seen-ts", type=float, default=None,
+        help="exclude tokens whose first swap ts is before this value — the "
+             "post-dedup-fix floor for the clean-window backtest (DECISIONS "
+             "runs #6/#7). Use 1782517950 for the current post-fix window.",
+    )
     b.add_argument(
         "--holdout-eval", action="store_true",
         help="evaluate on the locked holdout (charter §5.4; single-shot; "
