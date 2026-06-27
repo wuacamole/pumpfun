@@ -206,3 +206,35 @@ reached 30 (gate >=30) as data accumulated, but reliability slope 0.759 is now
 the lone sub-band criterion (was n_grad). Criteria are jittering near the
 boundary at this sample size; gate remains DEFERRED pending a stable
 clean-window run with slope in [0.8,1.2] AND n_grad_in_enter comfortably >30.
+
+[2026-06-27] [run] author=cli
+data_hash=—   backtest_runs_to_date=9
+metrics={"n_tokens": 1580, "n_enter": 104, "enter_hit_rate": 0.33653846153846156, "enter_mean_return": 1.1766891958594519, "brier": 0.05798941981320831}
+decision=note   rationale=backtest run #9 with config {'decision_every': 30.0, 'fold_size': 50, 'kind': 'logistic', 'n_examples': 1580, 'min_first_seen_ts': 1782517950.0}
+
+[2026-06-27] [kill] author=system
+data_hash=pumpfun.db (clean window, first_seen_ts>=1782517950) + time-ordered OOS
+backtest_runs_to_date=9
+metrics={vsol_alone_auc=0.860, model_overall_auc_gbm=0.649, model_overall_auc_logit=0.593, entryzone_auc_gbm=0.377, entryzone_auc_gbm_ci=[0.306,0.452], entryzone_auc_logit=0.454, entryzone_calib_gbm={p0-15:8.1%, p15-30:11.0%, p30-50:0.0%, p50-100:0.8%}, enter_hit=0.337, vsol_matched_baseline=0.267, enter_lift_vs_vsol=0.070}
+decision=kill
+rationale=The model's apparent edge is a vSol-level ARTIFACT, not skill, and must
+NOT be cited as §5.4 gate evidence. Evidence: (1) vSol-level ALONE scores
+time-ordered OOS AUC 0.860; the full model scores only 0.649 (gbm) / 0.593
+(logistic) — the behavioural features DEGRADE the trivial "high vSol => near
+graduation" signal. (2) Within every vSol band the model is anti-predictive:
+entry-zone[33-50] AUC 0.377 (gbm), bootstrap 95% CI [0.306,0.452] ENTIRELY below
+0.5 — statistically significant inversion (the conviction-engine-inverted finding
+reincarnated in the GBM). (3) Entry-zone calibration is inverted AND overconfident:
+tokens the model rates >50% graduate 0.8% (n=128); tokens it rates 0-15% graduate
+8.1%. (4) The backtest "+edge" came from ENTERing at median implied vSol ~72
+(already 63% to graduation); against a vSol-matched baseline the lift is only
++7.0pp (33.7% vs 26.7%) at n=104, much of which is noise — NOT the +21pp the old
+overall-baseline comparison implied. Two code bugs enabled the fiction and are
+fixed: refit selected by OVERALL AUC (deployed gbm, the worst entry-zone model)
+-> now selects by entry-zone AUC and REFUSES to deploy when it is <= 0.5 (it
+refused on this data); the backtest baseline was not vSol-matched -> now reports
+vsol_matched_baseline + enter_lift_vs_vsol. The live ENTER gate is neutered
+(WATCH-only) until a model with entry_zone_auc > 0.5 exists. Net: there is NO
+demonstrated alpha. The paper's premise (early behavioural conviction predicts
+graduation) does not hold in this data. Do NOT deploy capital. Next: find a
+feature with real at-fixed-vSol signal, or accept the strategy is unviable.

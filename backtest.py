@@ -98,6 +98,14 @@ class BacktestReport:
     brier_score: float              # calibration of est_grad_prob vs actual (all decisions)
     edge_over_time: list[float]     # rolling enter_hit_rate per fold
     trades: list[TradeOutcome] = field(default_factory=list)
+    # vSol-matched baseline: P(graduate) among ALL decisions at a similar vSol
+    # (breakeven_prob in the ENTER set's IQR). High-vSol tokens graduate
+    # mechanically more, so THIS — not baseline_hit_rate — is the honest bar.
+    # enter_lift_vs_vsol = enter_hit_rate - vsol_matched_baseline is the model's
+    # actual skill net of the vSol-level confound. If it's ~0, the "edge" is an
+    # artifact of entering tokens that were already close to graduation.
+    vsol_matched_baseline: float = float("nan")
+    enter_lift_vs_vsol: float = float("nan")
     # --- Phase 2 exit-gate diagnostics (charter §5.2) ---
     pr_auc: float = float("nan")           # PR-AUC (primary for <1% positives)
     log_loss: float = float("nan")         # log-loss
@@ -457,17 +465,41 @@ def run_backtest(
     # Fold stability: edge sign positive in every fold of the final window.
     fold_stable = bool(edge_over_time) and all(r > 0 for r in edge_over_time[-3:])
 
+    enter_hit_rate = ((sum(1 for t in enter_trades if t.graduated) / len(enter_trades))
+                      if enter_trades else float("nan"))
+
+    # vSol-matched baseline (the honest bar). The model ENTERs tokens that are
+    # already at high vSol (near graduation), which graduate mechanically more.
+    # Comparing enter_hit_rate to the overall baseline_hit_rate therefore credits
+    # the model for the vSol level, not for skill. Here we ask: among ALL decision
+    # points at a comparable vSol — breakeven_prob in the ENTER set's [P25,P75] —
+    # what fraction belong to tokens that graduated? enter_lift_vs_vsol is the
+    # model's grad-rate skill net of that confound. ~0 means no real edge.
+    vsol_matched = float("nan")
+    enter_lift = float("nan")
+    if enter_trades and trades:
+        be = np.array([t.breakeven_prob for t in enter_trades])
+        lo, hi = np.percentile(be, [25, 75])
+        all_be = np.array([t.breakeven_prob for t in trades])
+        all_g = np.array([1.0 if t.graduated else 0.0 for t in trades])
+        m = (all_be >= lo) & (all_be <= hi)
+        if m.any():
+            vsol_matched = float(all_g[m].mean())
+            if not math.isnan(enter_hit_rate):
+                enter_lift = enter_hit_rate - vsol_matched
+
     return BacktestReport(
         n_tokens=len(items),
         n_decisions=len(trades),
         n_enter=len(enter_trades),
         n_watch=sum(1 for t in trades if t.decision == "WATCH"),
         n_skip=sum(1 for t in trades if t.decision == "SKIP"),
-        enter_hit_rate=(sum(1 for t in enter_trades if t.graduated) / len(enter_trades))
-                       if enter_trades else float("nan"),
+        enter_hit_rate=enter_hit_rate,
         enter_mean_return=float(np.nanmean([t.realized_return for t in enter_trades]))
                            if enter_trades else float("nan"),
         baseline_hit_rate=(n_graduated / len(items)) if items else float("nan"),
+        vsol_matched_baseline=vsol_matched,
+        enter_lift_vs_vsol=enter_lift,
         brier_score=brier,
         edge_over_time=edge_over_time,
         trades=trades,
@@ -498,6 +530,8 @@ def write_report(report: BacktestReport, path: str | Path) -> Path:
         "enter_hit_rate": _safe(report.enter_hit_rate),
         "enter_mean_return": _safe(report.enter_mean_return),
         "baseline_hit_rate": _safe(report.baseline_hit_rate),
+        "vsol_matched_baseline": _safe(report.vsol_matched_baseline),
+        "enter_lift_vs_vsol": _safe(report.enter_lift_vs_vsol),
         "brier_score": _safe(report.brier_score),
         "pr_auc": _safe(report.pr_auc),
         "log_loss": _safe(report.log_loss),

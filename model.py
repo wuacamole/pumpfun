@@ -248,6 +248,12 @@ class FittedModel:
     pipeline: Pipeline | CalibratedClassifierCV
     brier_score: float
     feature_columns: list[str] = field(default_factory=lambda: list(FEATURE_COLUMNS))
+    # Entry-zone (33-50 vSol) time-ordered OOS AUC measured at refit time. This
+    # is the only metric that reflects the live gate's actual job (ranking tokens
+    # at the same vSol). The live monitor refuses to ENTER unless this is > 0.5
+    # — a model that can't discriminate where the gate fires must abstain rather
+    # than bet on the vSol level. NaN for models saved before this was tracked.
+    entry_zone_auc: float = float("nan")
 
     def predict(self, X: pd.DataFrame) -> np.ndarray:
         X = X[self.feature_columns]

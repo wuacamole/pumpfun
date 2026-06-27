@@ -404,9 +404,17 @@ async def run(
     fitted: FittedModel | None = None
     try:
         fitted = model_store.load(model_name)
-        print(f"loaded fitted model: kind={fitted.kind} brier={fitted.brier_score:.4f}")
+        ez = getattr(fitted, "entry_zone_auc", float("nan"))
+        validated = ez > 0.5
+        print(f"loaded fitted model: kind={fitted.kind} brier={fitted.brier_score:.4f} "
+              f"entry_zone_auc={ez:.3f}")
+        if not validated:
+            print("  WARNING: model has no validated entry-zone discrimination "
+                  "(entry_zone_auc <= 0.5 or absent) — ENTER gate is DISABLED "
+                  "(WATCH-only). See DECISIONS.md [kill] (vSol confound).")
     except FileNotFoundError:
-        print("no fitted model on disk — using hand-built heuristic (Phase 1 mode)")
+        print("no fitted model on disk — using hand-built heuristic (Phase 1 mode); "
+              "ENTER gate DISABLED (WATCH-only) until a validated model is trained")
 
     helius: HeliusClient | None = None
     use_logs_feed = False
@@ -884,15 +892,31 @@ def _maybe_score(
     # If a fitted model exists, recompute the graduation probability with it
     # and re-derive the edge/decision using the same thresholds. Otherwise the
     # hand-built estimate baked into the TokenScore stands.
+    # ENTER is only allowed when the model has validated entry-zone discrimination
+    # (entry_zone_auc > 0.5). Without that — an unvalidated model, an old model
+    # saved before the metric existed, or no model at all — the gate abstains
+    # (WATCH-only). See DECISIONS.md [kill] (vSol confound): a model that can't
+    # rank at fixed vSol must not bet.
+    enter_validated = (
+        fitted is not None
+        and getattr(fitted, "entry_zone_auc", float("nan")) > 0.5
+    )
     if fitted is not None:
         try:
             creator = creator_lookup(mint) if creator_lookup is not None else None
             est = predict_grad_prob(fitted, swaps, creator=creator)
             brk = _breakeven_probability(s.vsol)
             edge = est - brk
-            s = _rescore_with_model(s, est, edge)
+            s = _rescore_with_model(s, est, edge, allow_enter=enter_validated)
         except Exception:
             pass
+
+    # Final abstention guard: demote any ENTER to WATCH unless the model is
+    # entry-zone-validated. Covers the no-model / hand-built path too, whose
+    # conviction-based ENTER is anti-predictive (validate_conviction.py).
+    if not enter_validated and s.decision == "ENTER":
+        from dataclasses import replace
+        s = replace(s, decision="WATCH")
 
     ev = DecisionEvent(
         mint=mint, decision=s.decision, score=s.conviction_score,
@@ -922,17 +946,25 @@ def _maybe_score(
                   f"(cost {pos.entry_cost_sol:.4f})")
 
 
-def _rescore_with_model(s: TokenScore, est: float, edge: float) -> TokenScore:
+def _rescore_with_model(
+    s: TokenScore, est: float, edge: float, allow_enter: bool = True,
+) -> TokenScore:
     """Re-derive the decision using the fitted model's P(graduation).
 
     Returns a *new* frozen TokenScore (charter discipline: the score object is
     immutable so the dashboard and the persisted DecisionEvent can't drift apart
     from the logged swap record).
+
+    ``allow_enter`` is False when the loaded model has no validated entry-zone
+    discrimination (entry_zone_auc <= 0.5). In that case the gate abstains: a
+    positive edge becomes WATCH, never ENTER. A model that can't rank tokens at
+    the same vSol would otherwise ENTER on its most-confident-but-least-likely
+    tokens (the vSol-confound failure mode — see DECISIONS.md [kill]).
     """
     # Gate purely on the calibrated model's edge (est - breakeven). The old
     # conviction_score/bot_share filters here were inverted vs reality, so they're
     # gone — the model carries those signals as features now.
-    if edge > ENTER_EDGE_MARGIN:
+    if allow_enter and edge > ENTER_EDGE_MARGIN:
         decision = "ENTER"
     elif edge > 0:
         decision = "WATCH"

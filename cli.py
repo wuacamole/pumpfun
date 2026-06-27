@@ -68,6 +68,8 @@ def cmd_backtest(args: argparse.Namespace) -> int:
     print(f"  ENTER / WATCH / SKIP: {report.n_enter} / {report.n_watch} / {report.n_skip}")
     print(f"  baseline hit rate   : {report.baseline_hit_rate:.1%}  (P(graduation) overall)")
     print(f"  ENTER hit rate      : {report.enter_hit_rate:.1%}")
+    print(f"  vSol-matched base   : {report.vsol_matched_baseline:.1%}  (P(grad) at the same vSol — the HONEST bar)")
+    print(f"  ENTER lift vs vSol  : {report.enter_lift_vs_vsol:+.1%}  (skill net of vSol confound; ~0 = no real edge)")
     print(f"  ENTER mean return   : {report.enter_mean_return:+.1%}  (post fees/slippage/MEV)")
     print(f"  calibration Brier   : {report.brier_score:.4f}  (lower=better, 0=perfect)")
     print(f"  PR-AUC              : {report.pr_auc:.4f}  (primary for <1% positives)")
