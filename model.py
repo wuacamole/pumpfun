@@ -73,6 +73,10 @@ from conviction_engine import (
 )
 
 # Feature column order — frozen so saved models stay loadable.
+# Phase 2.2a additions (direct_call_share, n_entry_programs) sit at the end so
+# existing saved models that predate them stay loadable — the imputer fills
+# NaN for columns a model was trained without, and predict re-indexes by
+# feature_columns anyway. Don't reorder the pre-existing columns.
 FEATURE_COLUMNS: list[str] = [
     "vsol",
     "real_sol_bonded",
@@ -89,6 +93,14 @@ FEATURE_COLUMNS: list[str] = [
     "creator_rugged_count",
     "top_holder_share",
     "smart_money_present",
+    # Phase 2.2a — on-chain bot flag (is_direct) + route diversity. These use
+    # the real instruction-stack classification (zero RPC, parsed from logs),
+    # not the size-heuristic via_frontend. validate_conviction.py showed
+    # via_frontend is inverted vs reality (humans trade small, bots graduate);
+    # direct_call_share is the signal the paper actually measured. NaN when the
+    # feed didn't carry is_direct (PumpPortal/RPC-backfill paths).
+    "direct_call_share",
+    "n_entry_programs",
 ]
 
 LABEL_COL = "graduated"  # 1 if the token graduated, 0 otherwise
@@ -145,6 +157,21 @@ def featurize(
     sol_per_min = (vsol - _virtual_sol_start()) / (seconds / 60.0)
     c = creator or CreatorHistory()
 
+    # Phase 2.2a — on-chain bot flag (is_direct) + route diversity. is_direct
+    # is the real instruction-stack classification (pump invoked at top level =
+    # autonomous bot), distinct from the size-heuristic via_frontend. NaN when
+    # the feed didn't carry it (PumpPortal/RPC paths) so the imputer handles
+    # missingness. n_entry_programs counts distinct top-level programs driving
+    # trades — a high count means many distinct routers/bots are active (a
+    # traffic signal), a low count means one program dominates.
+    direct_swaps = [s for s in seen if s.is_direct is not None]
+    direct_call_share = (
+        sum(1 for s in direct_swaps if s.is_direct) / len(direct_swaps)
+        if direct_swaps else float("nan")
+    )
+    entry_programs = {s.entry_program for s in seen if s.entry_program}
+    n_entry_programs = float(len(entry_programs)) if entry_programs else float("nan")
+
     return {
         "vsol": vsol,
         "real_sol_bonded": real_sol_bonded,
@@ -161,6 +188,8 @@ def featurize(
         "creator_rugged_count": c.creator_rugged_count,
         "top_holder_share": c.top_holder_share,
         "smart_money_present": c.smart_money_present,
+        "direct_call_share": direct_call_share,
+        "n_entry_programs": n_entry_programs,
     }
 
 
@@ -194,8 +223,15 @@ class FittedModel:
         return np.asarray(self.pipeline.predict_proba(X)[:, 1])
 
     def predict_one(self, features: dict[str, float]) -> float:
-        X = feature_matrix([features])
-        return float(self.predict(X)[0])
+        # Fast path: build a single-row DataFrame with exactly the feature
+        # columns the pipeline expects (in order), avoiding the overhead of
+        # feature_matrix (which reindexes and handles missing columns). The
+        # walk-forward backtest calls this thousands of times — the per-call
+        # DataFrame construction was the bottleneck (~25ms each, growing with
+        # GC pressure). This direct path is ~1ms.
+        row = {col: features.get(col, float("nan")) for col in self.feature_columns}
+        X = pd.DataFrame([row], columns=self.feature_columns)
+        return float(self.pipeline.predict_proba(X)[0, 1])
 
 
 def fit(
@@ -246,14 +282,21 @@ def fit(
             )),
         ])
 
-    # Charter §5.2: probabilities must be calibrated. Isotonic calibration via
-    # internal CV — cv=3 (or 2 if too few positives) so it's honest, not in-
-    # sample. Falls back gracefully when there aren't enough positives for 3
-    # folds (uses cv=2 or skips calibration entirely on a single-class set).
+    # Charter §5.2: probabilities must be calibrated. Method chosen by positive
+    # count: isotonic is non-parametric (a step function fit to the data) and
+    # overfits the calibration curve when positives are scarce (we have ~423
+    # graduates — the in-sample Brier 0.0236 is suspiciously low for a 28.6%-
+    # base-rate problem, a symptom of isotonic overfitting). Platt (logistic)
+    # is parametric (2 parameters: slope + intercept) and far more stable with
+    # small data. Switch to isotonic only once the positive class is large
+    # enough for the step function to be well-constrained (~1000 positives).
+    ISOTONIC_MIN_POSITIVES = 1000
     if calibrate and len(np.unique(y)) == 2 and min(sum(y), sum(1 - y)) >= 2:
         n_splits = min(3, min(int(sum(y)), int(sum(1 - y))))
+        n_pos = int(sum(y))
+        method = "isotonic" if n_pos >= ISOTONIC_MIN_POSITIVES else "sigmoid"
         pipeline: Pipeline | CalibratedClassifierCV = CalibratedClassifierCV(
-            estimator=base, method="isotonic", cv=n_splits,
+            estimator=base, method=method, cv=n_splits,
         )
     else:
         pipeline = base

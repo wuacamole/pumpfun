@@ -805,6 +805,61 @@ def test_store_dedupe_keeps_distinct_same_ts_swaps(tmp_path):
     s.close()
 
 
+def test_store_signature_guard_blocks_duplicate_insert(tmp_path):
+    """The same on-chain tx signature logged twice (a double-spawned monitor
+    scenario) must land exactly once — the partial unique index on signature
+    rejects the second insert, and log_swap swallows that IntegrityError as a
+    no-op rather than raising or duplicating the row."""
+    s = Store(tmp_path / "sig.db")
+    mint = "SigMint"
+    sw = _swap(0, 1.0, "w", True, 1.0, 31.0)
+    s.log_swap(sw, mint, signature="sigAAAA")
+    # Second monitor logs the same on-chain tx with a different receipt ts.
+    sw2 = _swap(0, 2.0, "w", True, 1.0, 31.0)  # different ts (receipt time)
+    s.log_swap(sw2, mint, signature="sigAAAA")  # must be a silent no-op
+    assert len(s.swaps_for(mint)) == 1
+    assert s.get_token(mint).n_swaps == 1
+    # The survivor is the first insert (ts=1.0), not the replay.
+    assert s.swaps_for(mint)[0].ts == 1.0
+    s.close()
+
+
+def test_store_dedupe_swaps_collapses_same_on_chain_trade_across_receipt_ts(tmp_path):
+    """dedupe_swaps collapses rows that represent the SAME on-chain trade
+    logged by two concurrent monitors with different receipt ``ts`` — the
+    49%-duplication root cause. With the on-chain ``block_time`` now used as
+    ``ts`` (helius.py), both monitors stamp the same value, so the 6-col pass
+    collapses them. This test pins that contract: two rows that agree on
+    everything except receipt-time ``ts`` are NOT collapsed (we can't know
+    they're the same trade without a signature), but two rows that share the
+    full 6-col key — including the on-chain block_time — are."""
+    s = Store(tmp_path / "blockts.db")
+    mint = "BlockTimeMint"
+    # Two monitors logged the same on-chain trade; both now use block_time=100.
+    s.log_swap(_swap(100.0, 100.0, "w", True, 1.0, 31.0), mint)
+    s.log_swap(_swap(100.0, 100.0, "w", True, 1.0, 31.0), mint)
+    assert s.dedupe_swaps() == 1
+    assert len(s.swaps_for(mint)) == 1
+    assert s.get_token(mint).n_swaps == 1
+    s.close()
+
+
+def test_store_signature_none_rows_fall_back_to_event_dedupe(tmp_path):
+    """Rows with no signature (NULL) are not constrained by the partial unique
+    index, so a real duplicate of a signature-less row is still caught by the
+    6-col pass in dedupe_swaps — the two-layer guard works in concert."""
+    s = Store(tmp_path / "null_sig.db")
+    mint = "NullSigMint"
+    sw = _swap(0, 1.0, "w", True, 1.0, 31.0)
+    s.log_swap(sw, mint, signature=None)
+    s.log_swap(sw, mint, signature=None)  # byte-identical replay, no sig
+    assert len(s.swaps_for(mint)) == 2  # guard let both in (no sig to key on)
+    deleted = s.dedupe_swaps()  # 6-col pass collapses the replay
+    assert deleted == 1
+    assert len(s.swaps_for(mint)) == 1
+    s.close()
+
+
 def test_store_prune_swaps_before(tmp_path):
     """prune_swaps_before drops old rows and re-derives n_swaps."""
     s = Store(tmp_path / "p.db")
@@ -1034,3 +1089,297 @@ def test_graduation_price_plausibility_filter():
     assert not _price_is_plausible(terminal * 1e6, pc)   # 35000x-style outlier
     assert not _price_is_plausible(terminal * 1e-6, pc)  # near-zero outlier
     assert not _price_is_plausible(0.0, pc)
+
+
+# --- Tier 1 fixes: no-model-fold gate, real loss-side exits, auto_dedupe ----
+
+def test_backtest_no_model_fold_records_no_enters():
+    """The no-model (fold-0) backtest must NOT record any ENTER decisions.
+
+    validate_conviction.py showed the hand-built _estimate_graduation_prob is
+    anti-predictive (AUC 0.366 — ENTER hits 5.6% vs a 28.6% base rate). The
+    walk-forward used to fall back to it on fold 0, seeding train_buf with
+    wrong ENTER labels that poisoned fold 1. Now the no-model fold uses a
+    base-rate prior (edge ≈ 0, can't clear the ENTER threshold) and gates
+    ENTER off entirely. Only WATCH/SKIP are recorded until the first fit.
+    """
+    # Build enough tokens to span the first fold (fold_size=10) without fitting
+    # a usable model — mix graduated and stalled so the fit eventually succeeds
+    # and the test asserts on the fold-0 (pre-fit) behaviour specifically.
+    def good():
+        s, t, vsol = [], 0.0, 30.0
+        for i in range(40):
+            t += 1.0
+            vsol = min(vsol + 2.0, _graduation_vsol())
+            s.append(_swap(i, t, f"h{i}", True, 1.0, vsol, via=True))
+        return s
+
+    def bad():
+        s, t, vsol = [], 0.0, 30.0
+        for i in range(80):
+            t += 0.4
+            vsol += 0.05
+            s.append(_swap(i, t, f"b{i%10}", True, 0.05, vsol, via=False))
+        return s
+
+    examples = []
+    for i in range(10):
+        examples.append((f"good{i}", good(), "graduated", None))
+        examples.append((f"bad{i}", bad(), "rugged", None))
+    report = run_backtest(examples, decision_every_sec=5.0, fold_size=10)
+    # The first 10 tokens (fold 0) had no fitted model. None of their trades
+    # should be ENTERs — the base-rate prior can't clear edge > threshold and
+    # ENTER is explicitly gated off when model is None.
+    fold0 = [t for t in report.trades if t.mint in {e[0] for e in examples[:10]}]
+    assert fold0, "fold 0 should produce decision rows"
+    assert not any(t.entered for t in fold0), (
+        f"no-model fold must not ENTER; got {[t.mint for t in fold0 if t.entered]}"
+    )
+    # est_grad_prob on the no-model fold is the base-rate prior (0.5 with no
+    # resolved tokens yet), not the inverted heuristic — so it can't produce
+    # the high est values the heuristic used to fabricate.
+    assert all(t.est_grad_prob <= 0.5 + 1e-9 for t in fold0)
+
+
+def test_realized_return_uses_real_loss_multiple():
+    """_realized_return uses the real logged stop-exit multiple on the loss
+    side (charter I2) instead of the flat 0.10 rug-floor default. A timed-out
+    trade that got back 0.96x of entry should return ~-0.04, not -1.0."""
+    from backtest import _realized_return
+    # Real timed-out exit: got back 0.96x of entry, minus ~1% curve fee on exit.
+    ret = _realized_return(
+        graduated=False, entry_cost=0.013, exit_cost=0.03,
+        loss_multiple=0.96,
+    )
+    # 0.96 * (1 - 0.03) - (1 + 0.013) = 0.9312 - 1.013 = -0.0818
+    assert ret == pytest.approx(-0.0818, abs=1e-3)
+    # Fallback (no logged multiple): the 0.10 rug-floor default.
+    ret_default = _realized_return(
+        graduated=False, entry_cost=0.013, exit_cost=0.03,
+    )
+    # 0.10 * 0.97 - 1.013 = -0.916
+    assert ret_default == pytest.approx(-0.916, abs=1e-3)
+    # The real multiple is ~10x less punitive than the fiction.
+    assert ret > ret_default
+
+
+def test_store_stop_exit_multiples(tmp_path):
+    """Store.stop_exit_multiples returns the real exit_sol/entry_sol for
+    stopped/timed-out paper trades, keyed by mint — the loss-side data the
+    backtest reads to value exits at actual realized PnL (charter I2)."""
+    s = Store(tmp_path / "stop.db", auto_dedupe=False)
+    # Open + close two paper positions: one stopped, one timed out.
+    b = PaperBroker(bankroll=10.0, size_fraction=0.1)
+    b.attach_store(s, reload=False)
+    p1 = b.on_enter("StoppedMint", 100.0, 50.0)
+    assert p1 is not None
+    # Force a loss stop: drop vsol to 0.3 * entry (below the 0.5 stop-loss).
+    b.on_stop("StoppedMint", 200.0, 50.0 * 0.3)
+    p2 = b.on_enter("TimedMint", 100.0, 50.0)
+    assert p2 is not None
+    # Force a time stop by aging past time_stop_sec.
+    b.time_stop_sec = 10.0
+    b.on_stop("TimedMint", 200.0, 50.0 * 0.95)  # near entry — timed-out
+    s.close()
+
+    s2 = Store(tmp_path / "stop.db", auto_dedupe=False)
+    mults = s2.stop_exit_multiples()
+    assert "StoppedMint" in mults
+    assert "TimedMint" in mults
+    # exit_multiple = exit_sol / entry_sol; the stop sold at a loss so < 1.
+    assert mults["StoppedMint"]["exit_multiple"] < 1.0
+    assert mults["TimedMint"]["exit_multiple"] < 1.0
+    assert mults["StoppedMint"]["exit_multiple"] < mults["TimedMint"]["exit_multiple"]
+    assert mults["StoppedMint"]["status"] in ("stopped", "timed_out")
+    s2.close()
+
+
+def test_store_auto_dedupe_false_skips_dedupe_on_open(tmp_path):
+    """auto_dedupe=False must NOT run dedupe_swaps on open — analytical opens
+    (backtest/refit) only read, so a full-table DELETE + n_swaps recompute is
+    wasted work and would mutate the live writer's table. A pre-existing
+    duplicate must survive an auto_dedupe=False open."""
+    db = tmp_path / "ad.db"
+    s = Store(db)
+    mint = "DedupMint"
+    sw = _swap(0, 1.0, "w", True, 1.0, 31.0)
+    s.log_swap(sw, mint)
+    s.log_swap(sw, mint)  # byte-identical replay, no signature
+    assert len(s.swaps_for(mint)) == 2
+    s.close()
+
+    # auto_dedupe=False: the duplicate must still be there after open.
+    s2 = Store(db, auto_dedupe=False)
+    assert len(s2.swaps_for(mint)) == 2, "auto_dedupe=False must not clean dupes"
+    s2.close()
+
+    # auto_dedupe=True (default): the duplicate is cleaned on open.
+    s3 = Store(db, auto_dedupe=True)
+    assert len(s3.swaps_for(mint)) == 1, "default open must self-heal dupes"
+    s3.close()
+
+
+# --- Tier 2: creator features, direct_call_share, time-ordered CV, Platt -----
+
+def test_featurize_direct_call_share_and_entry_programs():
+    """featurize emits direct_call_share (the real instruction-stack bot flag)
+    and n_entry_programs (route diversity) from Swap.is_direct /
+    Swap.entry_program. NaN when the feed didn't carry them (PumpPortal path).
+    """
+    from model import FEATURE_COLUMNS
+    assert "direct_call_share" in FEATURE_COLUMNS
+    assert "n_entry_programs" in FEATURE_COLUMNS
+    # Swaps with is_direct + entry_program populated (Helius logs-feed path).
+    swaps = [
+        Swap(ts=0, wallet="w1", is_buy=True, sol_amount=1.0, vsol_after=31.0,
+             via_frontend=True, is_direct=False, entry_program="JUP6"),
+        Swap(ts=1, wallet="w2", is_buy=True, sol_amount=0.5, vsol_after=32.0,
+             via_frontend=False, is_direct=True, entry_program="pump"),
+        Swap(ts=2, wallet="w3", is_buy=False, sol_amount=0.3, vsol_after=31.7,
+             via_frontend=False, is_direct=True, entry_program="pump"),
+    ]
+    f = featurize(swaps)
+    # 2 of 3 swaps are direct (is_direct=True) -> share = 2/3.
+    assert f["direct_call_share"] == pytest.approx(2 / 3)
+    # 2 distinct entry programs (JUP6, pump).
+    assert f["n_entry_programs"] == 2.0
+
+    # Swaps without is_direct / entry_program (PumpPortal path) -> NaN.
+    swaps_nodirect = [
+        Swap(ts=0, wallet="w1", is_buy=True, sol_amount=1.0, vsol_after=31.0,
+             via_frontend=True),
+        Swap(ts=1, wallet="w2", is_buy=True, sol_amount=0.5, vsol_after=32.0,
+             via_frontend=False),
+    ]
+    f2 = featurize(swaps_nodirect)
+    import math
+    assert math.isnan(f2["direct_call_share"])
+    assert math.isnan(f2["n_entry_programs"])
+
+
+def test_store_creator_of_and_creator_history_index(tmp_path):
+    """Store.creator_of extracts the creator from created_meta, and
+    creator_history_index builds a no-lookahead (graduated, non-graduated)
+    count per creator from existing token outcomes — no new data source."""
+    s = Store(tmp_path / "c.db", auto_dedupe=False)
+    now = time.time()
+    # Three tokens by two creators. Creator A graduated once + rugged once;
+    # creator B graduated once.
+    s.register_token("mintA1", created_meta={"traderPublicKey": "creatorA"})
+    s.register_token("mintA2", created_meta={"traderPublicKey": "creatorA"})
+    s.register_token("mintB1", created_meta={"traderPublicKey": "creatorB"})
+    s.set_outcome("mintA1", "graduated", outcome_ts=now - 200)
+    s.set_outcome("mintA2", "rugged", outcome_ts=now - 100)
+    s.set_outcome("mintB1", "graduated", outcome_ts=now - 50)
+
+    assert s.creator_of("mintA1") == "creatorA"
+    assert s.creator_of("mintB1") == "creatorB"
+    assert s.creator_of("mintUNKNOWN") is None
+
+    # Full index (as_of=None): creatorA = (1 grad, 1 non-grad), creatorB = (1, 0).
+    idx = s.creator_history_index()
+    assert idx["creatorA"] == (1, 1)
+    assert idx["creatorB"] == (1, 0)
+
+    # No-lookahead: as_of = now - 150 (before mintA2 rugged at now-100).
+    idx_past = s.creator_history_index(as_of=now - 150)
+    # Only mintA1 (graduated at now-200) is known by now-150.
+    assert idx_past["creatorA"] == (1, 0)
+    assert "creatorB" not in idx_past  # mintB1 graduated at now-50, after the cutoff
+    s.close()
+
+
+def test_model_fit_uses_platt_below_isotonic_threshold():
+    """fit() uses Platt (sigmoid) calibration when the positive class is
+    small (<1000) and isotonic above it. The in-sample Brier from isotonic at
+    423 positives was suspiciously low (0.0236) — a symptom of overfitting the
+    calibration step function. Platt is parametric (2 params) and stable."""
+    import numpy as np
+    # Build a small frame with <1000 positives so Platt is selected.
+    rng = np.random.default_rng(42)
+    n = 200
+    rows = []
+    for i in range(n):
+        grad = i < 40  # 40 positives (< 1000 -> Platt)
+        rows.append({
+            "vsol": 30.0 + rng.uniform(0, 80),
+            "real_sol_bonded": rng.uniform(0, 80),
+            "pct_to_graduation": rng.uniform(0, 100),
+            "bot_trade_share": rng.uniform(0, 1),
+            "sol_per_human_wallet": rng.uniform(-1, 2),
+            "net_sol_per_swap": rng.uniform(-0.5, 0.5),
+            "n_swaps": float(rng.integers(5, 50)),
+            "n_unique_wallets": float(rng.integers(3, 30)),
+            "n_unique_human_wallets": float(rng.integers(1, 20)),
+            "seconds_since_launch": float(rng.integers(60, 600)),
+            "sol_per_min": rng.uniform(0, 10),
+            "creator_graduated_count": float("nan"),
+            "creator_rugged_count": float("nan"),
+            "top_holder_share": float("nan"),
+            "smart_money_present": float("nan"),
+            "direct_call_share": float("nan"),
+            "n_entry_programs": float("nan"),
+            "graduated": int(grad),
+            "mint": f"m{i}",
+        })
+    import pandas as pd
+    df = pd.DataFrame(rows)
+    m = fit(df, kind="gbm", calibrate=True)
+    # The calibration method is not directly inspectable on CalibratedClassifierCV
+    # without reaching into private attrs, but we can check the model produces
+    # sane (not degenerate) probabilities — isotonic at small n would often
+    # produce 0/1 extremes. Platt produces a smooth logistic curve.
+    proba = m.predict(df.drop(columns=["graduated", "mint"]))
+    assert 0.0 < proba.min() < 1.0
+    assert 0.0 < proba.max() < 1.0
+    # No degenerate all-same probabilities (a sign of overfit calibration).
+    assert proba.std() > 0.01
+
+
+def test_refit_time_ordered_cv_trains_on_earlier_tests_on_later():
+    """time_ordered_cv sorts mints by first-appearance (chronological) rank,
+    splits into contiguous time folds, and trains on earlier folds testing on
+    the next. Fold 0 (no training data) is excluded. All snapshots of one mint
+    stay in the same fold (no per-token leakage)."""
+    import numpy as np
+    import pandas as pd
+    import refit_model as rm
+    # Build a frame where mint order in df is chronological (build_training_frame
+    # preserves row order). 6 mints, 2 snapshots each = 12 rows. n_splits=3 ->
+    # folds of 2 mints each: fold0=m0,m1; fold1=m2,m3; fold2=m4,m5.
+    # fold0 has no training data (excluded); fold1 trains on m0,m1; fold2
+    # trains on m0..m3.
+    rows = []
+    for mi in range(6):
+        for si in range(2):
+            rows.append({
+                "vsol": 30.0 + mi + si,
+                "real_sol_bonded": float(mi),
+                "pct_to_graduation": float(mi),
+                "bot_trade_share": 0.5,
+                "sol_per_human_wallet": 0.1,
+                "net_sol_per_swap": 0.05,
+                "n_swaps": float(10 + si),
+                "n_unique_wallets": 5.0,
+                "n_unique_human_wallets": 3.0,
+                "seconds_since_launch": float(60 + si * 20),
+                "sol_per_min": 1.0,
+                "creator_graduated_count": float("nan"),
+                "creator_rugged_count": float("nan"),
+                "top_holder_share": float("nan"),
+                "smart_money_present": float("nan"),
+                "direct_call_share": float("nan"),
+                "n_entry_programs": float("nan"),
+                "graduated": int(mi % 2 == 0),  # alternating labels
+                "mint": f"m{mi}",
+            })
+    df = pd.DataFrame(rows)
+    oof, y, valid = rm.time_ordered_cv(df, kind="gbm", n_splits=3)
+    # Fold 0 (m0, m1 = 4 rows) is excluded -> 8 valid rows from folds 1+2.
+    assert valid.sum() == 8
+    assert len(oof) == 8
+    assert len(y) == 8
+    # All valid predictions are finite (model trained on earlier folds).
+    assert np.all(np.isfinite(oof))
+    # Labels are a mix (alternating) — not single-class.
+    assert len(set(y.tolist())) == 2

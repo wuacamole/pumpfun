@@ -26,3 +26,7 @@ metrics.jsonl
 live_monitor.log
 pumpfun.log
 monitor.pid
+backtest_old_features.json
+backtest_old_model.json
+backtest_postfix_clean.json
+backtest_runs.jsonl

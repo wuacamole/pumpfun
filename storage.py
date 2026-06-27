@@ -25,6 +25,7 @@ SQLite's WAL mode handles that. Don't share a write connection across processes.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import sqlite3
 import time
@@ -55,6 +56,13 @@ CREATE TABLE IF NOT EXISTS swaps (
     entry_program TEXT,                        -- raw top-level program driving the trade
                                              -- (pump=direct, else router/bot); NULL if unknown.
                                              -- Categorise at retrain via helius.route_category.
+    signature   TEXT,                          -- on-chain tx signature (logsSubscribe's
+                                             -- ``signature``). NULL when the feed didn't
+                                             -- carry one (PumpPortal event / RPC backfill
+                                             -- without sig). Backs the insert-time guard +
+                                             -- ``dedupe_swaps`` so a double-spawned monitor
+                                             -- can't double-log the same on-chain trade
+                                             -- even when receipt ``ts`` differs.
     source      TEXT    NOT NULL DEFAULT 'pumpportal',  -- feed provenance
     ingested_at REAL    NOT NULL
 );
@@ -66,6 +74,8 @@ CREATE TABLE IF NOT EXISTS swaps (
 -- redundant given the composite (its leftmost column is mint) and is dropped.
 CREATE INDEX IF NOT EXISTS ix_swaps_mint_ts ON swaps(mint, ts);
 CREATE INDEX IF NOT EXISTS ix_swaps_ts      ON swaps(ts);
+-- The partial unique index on ``signature`` is created in :meth:`_migrate`
+-- (after the column add) so legacy DBs that predate the column can still open.
 DROP INDEX IF EXISTS ix_swaps_mint;
 """
 
@@ -162,6 +172,9 @@ _SWAPS_PARQUET_SCHEMA = pa.schema([
     ("sol_amount", pa.float64()),
     ("vsol_after", pa.float64()),
     ("via_frontend", pa.bool_()),
+    ("is_direct", pa.bool_()),
+    ("entry_program", pa.string()),
+    ("signature", pa.string()),
     ("source", pa.string()),
     ("ingested_at", pa.float64()),
 ])
@@ -190,9 +203,17 @@ class Store:
 
     Open one instance per writer process. Readers (backtest/model) should open
     their own read-only connection or use :func:`export_parquet` snapshots.
+
+    ``auto_dedupe``: when True (default), run :meth:`dedupe_swaps` on open to
+    self-heal legacy double-spawned-monitor corruption. Analytical opens
+    (backtest, refit_model, validate_conviction) should pass ``False`` — they
+    only read, so a full-table DELETE + ``n_swaps`` recompute is wasted work
+    and would mutate the live writer's table out from under it. The writer
+    (``live_monitor``) keeps the default so the store self-heals on every
+    restart.
     """
 
-    def __init__(self, path: str | Path = "pumpfun.db") -> None:
+    def __init__(self, path: str | Path = "pumpfun.db", *, auto_dedupe: bool = True) -> None:
         self.path = Path(path)
         self.conn = sqlite3.connect(str(self.path), isolation_level=None)
         self.conn.row_factory = sqlite3.Row
@@ -203,6 +224,17 @@ class Store:
         self.conn.executescript(SCHEMA_TOKENS)
         self.conn.executescript(SCHEMA_PAPER)
         self._migrate()
+        if auto_dedupe:
+            # Clean dupes left by a prior double-spawned monitor (two instances
+            # each logged every trade; with receipt-time ``ts`` differing
+            # between them the 6-col dedupe missed them). Running on every
+            # writer open makes the store self-healing: the next live_monitor
+            # that boots collapses the table back to the canonical
+            # one-row-per-on-chain-trade state. Skipped for analytical opens
+            # (backtest/refit) — they only read, so the DELETE + n_swaps
+            # recompute is wasted work and would fight the live writer.
+            with contextlib.suppress(sqlite3.OperationalError):
+                self.dedupe_swaps()
         # Truncate the WAL on open. Without an explicit checkpoint the WAL grows
         # unbounded under a long-lived writer (SQLite only auto-checkpoints when
         # the WAL crosses wal_autocheckpoint pages, and never truncates the file
@@ -218,6 +250,20 @@ class Store:
             self.conn.execute("ALTER TABLE swaps ADD COLUMN is_direct INTEGER")
         if "entry_program" not in cols:
             self.conn.execute("ALTER TABLE swaps ADD COLUMN entry_program TEXT")
+        if "signature" not in cols:
+            self.conn.execute("ALTER TABLE swaps ADD COLUMN signature TEXT")
+        # Partial unique index on signature: a second insert of the SAME
+        # on-chain tx signature is rejected at insert time, so a
+        # double-spawned monitor can't duplicate-row the table even before
+        # ``dedupe_swaps`` runs. SQLite treats NULL signatures as distinct
+        # from each other (no constraint enforced), so rows from feeds
+        # without a signature still go through the 6-col dedupe path. Created
+        # here (not in SCHEMA_SWAPS) so legacy DBs that just got the column
+        # via ALTER TABLE can still open.
+        self.conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS ux_swaps_signature "
+            "ON swaps(signature) WHERE signature IS NOT NULL"
+        )
 
     def checkpoint(self) -> None:
         """Flush the WAL into the main db and truncate it back to zero.
@@ -235,14 +281,34 @@ class Store:
         mint: str,
         source: str = "pumpportal",
         ingested_at: float | None = None,
+        signature: str | None = None,
     ) -> None:
-        """Append one swap. Idempotent-ish: we don't dedupe, so don't replay."""
+        """Append one swap. Idempotent-ish: we don't dedupe, so don't replay.
+
+        When ``signature`` is provided (the on-chain tx signature from the
+        logs feed) the row is guarded by the partial unique index
+        ``ux_swaps_signature`` — a second insert of the same signature is a
+        no-op. That keeps a double-spawned monitor from duplicating rows
+        even when the receipt ``ts`` differs between the two instances.
+        """
         # Wrap both statements in a single transaction so a crash between them
         # doesn't leave the tokens table out of sync with the swaps table.
         self.conn.execute("BEGIN")
         try:
-            self._log_swap_inner(swap, mint, source, ingested_at)
+            self._log_swap_inner(swap, mint, source, ingested_at, signature)
             self.conn.execute("COMMIT")
+        except sqlite3.IntegrityError as e:
+            # A UNIQUE-violation on ``signature`` means this exact on-chain tx
+            # is already logged — the very corruption the signature guard
+            # exists to prevent. Roll back the empty transaction and return;
+            # callers treat log_swap as best-effort append. Match on the
+            # column name (SQLite reports "UNIQUE constraint failed:
+            # swaps.signature") rather than the index name so this stays
+            # correct if the index is renamed.
+            self.conn.execute("ROLLBACK")
+            if signature is not None and "signature" in str(e):
+                return
+            raise
         except Exception:
             self.conn.execute("ROLLBACK")
             raise
@@ -253,19 +319,25 @@ class Store:
         mint: str,
         source: str = "pumpportal",
         ingested_at: float | None = None,
+        signature: str | None = None,
     ) -> None:
         """Insert a swap + update the token row. Caller manages the transaction.
 
         Split out from :meth:`log_swap` so :meth:`log_swaps` can wrap a batch
         in a *single* outer transaction without nesting BEGIN/COMMIT (SQLite
         raises "cannot start a transaction within a transaction").
+
+        A duplicate ``signature`` raises ``sqlite3.IntegrityError`` from the
+        partial unique index; the caller (``log_swap``) rolls back, so a
+        replay of a known on-chain tx is a silent no-op rather than a
+        duplicate row.
         """
         is_direct = getattr(swap, "is_direct", None)
         self.conn.execute(
             """INSERT INTO swaps
                  (mint, ts, wallet, is_buy, sol_amount, vsol_after, via_frontend,
-                  is_direct, entry_program, source, ingested_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                  is_direct, entry_program, signature, source, ingested_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 mint,
                 swap.ts,
@@ -276,6 +348,7 @@ class Store:
                 1 if swap.via_frontend else 0,
                 None if is_direct is None else (1 if is_direct else 0),
                 getattr(swap, "entry_program", None),
+                signature,
                 source,
                 ingested_at if ingested_at is not None else time.time(),
             ),
@@ -294,12 +367,31 @@ class Store:
             (mint, swap.ts, swap.ts, swap.vsol_after, 1, now),
         )
 
-    def log_swaps(self, mint: str, swaps: Iterable[Swap], source: str = "pumpportal") -> None:
-        """Bulk append. Wraps the batch in a single transaction."""
+    def log_swaps(
+        self,
+        mint: str,
+        swaps: Iterable[Swap],
+        source: str = "pumpportal",
+        signatures: Iterable[str | None] | None = None,
+    ) -> None:
+        """Bulk append. Wraps the batch in a single transaction.
+
+        ``signatures`` (optional) parallels ``swaps``; the i-th element is the
+        on-chain tx signature for the i-th swap (None when unavailable). A
+        duplicate signature is skipped inside the batch rather than aborting
+        the whole transaction — see :meth:`log_swap` for the guard rationale.
+        """
+        sig_iter = iter(signatures) if signatures is not None else None
         self.conn.execute("BEGIN")
         try:
             for s in swaps:
-                self._log_swap_inner(s, mint, source)
+                sig = next(sig_iter, None) if sig_iter is not None else None
+                try:
+                    self._log_swap_inner(s, mint, source, None, sig)
+                except sqlite3.IntegrityError as e:
+                    if sig is not None and "signature" in str(e):
+                        continue  # already logged — skip this swap
+                    raise
             self.conn.execute("COMMIT")
         except Exception:
             self.conn.execute("ROLLBACK")
@@ -340,19 +432,41 @@ class Store:
         the same on-chain event) share all six columns. ``id``/``ingested_at``
         are excluded on purpose — they differ across replays of the same event,
         so including them would defeat the dedupe.
+
+        Two passes run inside one transaction: a **signature** pass first
+        (collapses legacy rows where the partial unique index wasn't present
+        at insert time, so the same on-chain tx was logged multiple times with
+        different receipt ``ts``), then the 6-col event-key pass for rows
+        whose feed carried no signature. The lowest ``id`` (earliest insert)
+        is the survivor in both passes.
         """
         # DELETE + recompute must be atomic: a crash between them would leave
         # n_swaps stale — the exact drift this guards against. Same single-txn
         # pattern as log_swap/log_swaps.
         self.conn.execute("BEGIN")
         try:
+            # Pass 1: on-chain signature. Survives receipt-time differences
+            # between concurrent monitors — the 49%-duplication root cause.
+            cur = self.conn.execute(
+                """DELETE FROM swaps
+                     WHERE signature IS NOT NULL
+                       AND id NOT IN (
+                         SELECT MIN(id) FROM swaps
+                         WHERE signature IS NOT NULL
+                         GROUP BY signature
+                       )"""
+            )
+            deleted = cur.rowcount or 0
+            # Pass 2: 6-col event key for signature-less rows (PumpPortal /
+            # RPC-backfill paths). vsol_after discriminates genuine same-ts
+            # trades from a byte-identical replay.
             cur = self.conn.execute(
                 """DELETE FROM swaps WHERE id NOT IN (
                      SELECT MIN(id) FROM swaps
                      GROUP BY mint, ts, wallet, is_buy, sol_amount, vsol_after
                    )"""
             )
-            deleted = cur.rowcount or 0
+            deleted += cur.rowcount or 0
             if deleted:
                 self._recompute_n_swaps()
             self.conn.execute("COMMIT")
@@ -450,6 +564,8 @@ class Store:
                 sol_amount=r["sol_amount"],
                 vsol_after=r["vsol_after"],
                 via_frontend=bool(r["via_frontend"]),
+                is_direct=(None if r["is_direct"] is None else bool(r["is_direct"])),
+                entry_program=r["entry_program"],
             )
             for r in rows
         ]
@@ -466,6 +582,75 @@ class Store:
             )
         ]
 
+    def creator_of(self, mint: str) -> str | None:
+        """The creator (traderPublicKey) of a token, from the create-event
+        metadata. None when ``created_meta`` is absent or doesn't carry the
+        field. This is the join key for the Phase 2.2 creator-history features.
+        """
+        row = self.conn.execute(
+            "SELECT created_meta FROM tokens WHERE mint = ?", (mint,)
+        ).fetchone()
+        if row is None or not row["created_meta"]:
+            return None
+        try:
+            meta = json.loads(row["created_meta"])
+        except (json.JSONDecodeError, TypeError):
+            return None
+        creator = meta.get("traderPublicKey") or meta.get("creator") or meta.get("user")
+        return creator if isinstance(creator, str) else None
+
+    def creator_history_index(
+        self, as_of: float | None = None
+    ) -> dict[str, tuple[int, int]]:
+        """Per-creator (graduated_count, rugged_or_stalled_count) index.
+
+        Phase 2.2 join data — derived from existing ``tokens.created_meta``
+        (the create event's ``traderPublicKey``) + ``tokens.outcome``, so no
+        new data source is needed. 1,609 of 5,834 creators have >1 token, so
+        the join has real signal for repeat creators.
+
+        ``as_of``: no-lookahead discipline — only count tokens whose outcome
+        was *known by* ``as_of`` (``outcome_ts <= as_of``). A token that
+        graduated at ts=200 must not contribute to the creator-history of a
+        token scored at ts=100. When None, counts all resolved tokens (the
+        live-monitor case is "now" — every resolved outcome is fair). Tokens
+        with ``outcome='unknown'`` are excluded; ``stalled`` and ``rugged``
+        both count as non-graduations on the creator's record.
+
+        Returns ``{creator_address: (n_graduated, n_non_graduated)}``. Callers
+        build :class:`model.CreatorHistory` from this via the mint's creator.
+        """
+        if as_of is None:
+            rows = self.conn.execute(
+                """SELECT json_extract(created_meta, '$.traderPublicKey') AS creator,
+                          outcome
+                   FROM tokens
+                   WHERE created_meta IS NOT NULL
+                     AND outcome IN ('graduated', 'stalled', 'rugged')"""
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                """SELECT json_extract(created_meta, '$.traderPublicKey') AS creator,
+                          outcome
+                   FROM tokens
+                   WHERE created_meta IS NOT NULL
+                     AND outcome IN ('graduated', 'stalled', 'rugged')
+                     AND outcome_ts IS NOT NULL
+                     AND outcome_ts <= ?""",
+                (as_of,),
+            ).fetchall()
+        index: dict[str, tuple[int, int]] = {}
+        for r in rows:
+            creator = r["creator"]
+            if not creator:
+                continue
+            g, n = index.get(creator, (0, 0))
+            if r["outcome"] == "graduated":
+                index[creator] = (g + 1, n)
+            else:
+                index[creator] = (g, n + 1)
+        return index
+
     # ------------------------------------------------------------ parquet
     def _write_swaps_parquet(self, path: Path) -> None:
         """Stream the ``swaps`` table to a Parquet file in bounded batches.
@@ -479,7 +664,7 @@ class Store:
         """
         cur = self.conn.execute(
             "SELECT mint, ts, wallet, is_buy, sol_amount, vsol_after, via_frontend, "
-            "source, ingested_at FROM swaps"
+            "is_direct, entry_program, signature, source, ingested_at FROM swaps"
         )
         writer = pq.ParquetWriter(str(path), _SWAPS_PARQUET_SCHEMA)  # type: ignore[no-untyped-call]
         try:
@@ -497,6 +682,9 @@ class Store:
                             "sol_amount": r["sol_amount"],
                             "vsol_after": r["vsol_after"],
                             "via_frontend": bool(r["via_frontend"]),
+                            "is_direct": bool(r["is_direct"]) if r["is_direct"] is not None else None,
+                            "entry_program": r["entry_program"],
+                            "signature": r["signature"],
                             "source": r["source"],
                             "ingested_at": r["ingested_at"],
                         }
@@ -744,6 +932,42 @@ class Store:
         """All logged graduation prices, keyed by mint. For the backtest."""
         rows = self.conn.execute("SELECT * FROM graduation_prices").fetchall()
         return {r["mint"]: dict(r) for r in rows}
+
+    def stop_exit_multiples(self) -> dict[str, dict[str, object]]:
+        """Realized exit multiples for non-graduated paper trades, keyed by mint.
+
+        For each stopped/timed-out position the paper broker closed, returns
+        ``{mint: {"status": str, "exit_multiple": float, "entry_sol": float,
+        "exit_sol": float}}`` where ``exit_multiple = exit_sol / entry_sol``.
+        The backtest uses this to value the loss side at the *actual* realized
+        PnL (charter I2) instead of the flat rug-floor default (0.10x), which
+        overstates losses by ~6x for timed-out trades (avg 0.96x in practice).
+
+        Only the most recent close per mint is returned (one position per mint
+        in the backtest). Open trades are excluded — no realized exit yet.
+        """
+        rows = self.conn.execute(
+            """SELECT mint, status, entry_sol, exit_sol,
+                      CASE WHEN entry_sol > 0 THEN exit_sol / entry_sol ELSE 0 END AS exit_multiple,
+                      closed_at
+               FROM paper_trades
+               WHERE status IN ('stopped', 'timed_out')
+                 AND exit_sol IS NOT NULL
+                 AND entry_sol > 0
+               ORDER BY closed_at DESC"""
+        ).fetchall()
+        out: dict[str, dict[str, object]] = {}
+        for r in rows:
+            # First row per mint wins (most recent close, per the ORDER BY).
+            if r["mint"] in out:
+                continue
+            out[r["mint"]] = {
+                "status": r["status"],
+                "exit_multiple": float(r["exit_multiple"]),
+                "entry_sol": float(r["entry_sol"]),
+                "exit_sol": float(r["exit_sol"]),
+            }
+        return out
 
 
 def load_latest_snapshot(snap_dir: str | Path = "snapshots") -> tuple[Path, Path, Path]:

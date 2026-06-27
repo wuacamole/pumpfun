@@ -35,7 +35,9 @@ def cmd_backtest(args: argparse.Namespace) -> int:
     if args.holdout_eval:
         print("WARNING: --holdout-eval consumes the locked holdout (charter §9.1). "
               "This is a single-shot evaluation; re-running voids the pre-registration.")
-    examples, graduation_prices = load_examples_from_store(args.db, holdout_start_ts=holdout)
+    examples, graduation_prices, stop_exit_multiples = load_examples_from_store(
+        args.db, holdout_start_ts=holdout,
+    )
     if not examples:
         print(f"no labelled tokens in {args.db} — collect data first")
         return 1
@@ -55,6 +57,7 @@ def cmd_backtest(args: argparse.Namespace) -> int:
         fold_size=args.fold_size,
         model_kind=args.kind,
         graduation_prices=graduation_prices,
+        stop_exit_multiples=stop_exit_multiples,
     )
     out = write_report(report, args.out)
     print("\n=== backtest report ===")
@@ -97,7 +100,7 @@ def cmd_backtest(args: argparse.Namespace) -> int:
 
 
 def cmd_fit(args: argparse.Namespace) -> int:
-    store = Store(args.db)
+    store = Store(args.db, auto_dedupe=False)
     labelled = store.labelled_mints()
     if not labelled:
         print(f"no labelled tokens in {args.db} — collect data first")
@@ -126,7 +129,7 @@ def cmd_fit(args: argparse.Namespace) -> int:
 
 
 def cmd_export(args: argparse.Namespace) -> int:
-    store = Store(args.db)
+    store = Store(args.db, auto_dedupe=False)
     p = store.export_parquet(args.out_dir)
     print(f"snapshot written: {p}")
     # Optional retention: now that the full history is captured in the immutable
