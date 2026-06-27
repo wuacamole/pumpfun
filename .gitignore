@@ -32,3 +32,4 @@ backtest_postfix_clean.json
 backtest_runs.jsonl
 backtest_cli_clean.json
 backtest_postfix_clean_rerun.json
+backtest_cli_clean2.json

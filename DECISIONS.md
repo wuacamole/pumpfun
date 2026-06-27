@@ -164,3 +164,45 @@ decision=note   rationale=backtest run #6 with config {'decision_every': 30.0, '
   flag (reproducible + counted). 4 of 5 gate criteria pass; n_grad_in_enter=25
   is the lone blocker and is climbing (20 -> 25). Gate deferred pending ~5 more
   clean graduates in the ENTER zone.
+
+[2026-06-27] [run] author=cli
+data_hash=—   backtest_runs_to_date=7
+metrics={"n_tokens": 1446, "n_enter": 95, "enter_hit_rate": 0.29473684210526313, "enter_mean_return": 1.0078818962671916, "brier": 0.05746002477293715}
+decision=note   rationale=backtest run #7 with config {'decision_every': 30.0, 'fold_size': 50, 'kind': 'logistic', 'n_examples': 1446, 'min_first_seen_ts': 1782517950.0}
+
+[2026-06-27] [run] author=cli
+data_hash=—   backtest_runs_to_date=8
+metrics={"n_tokens": 1477, "n_enter": 91, "enter_hit_rate": 0.32967032967032966, "enter_mean_return": 1.1519757924852796, "brier": 0.05850784877117671}
+decision=note   rationale=backtest run #8 with config {'decision_every': 30.0, 'fold_size': 50, 'kind': 'logistic', 'n_examples': 1477, 'min_first_seen_ts': 1782517950.0}
+
+[2026-06-27] [model] author=system
+data_hash=pumpfun.db (clean window) + models/latest.pkl (refit, gbm)
+backtest_runs_to_date=8
+metrics={ths_univariate_auc=0.667, ths_grad_median=0.443, ths_nongrad_median=0.725, ab_gbm_delta_auc=-0.005, ab_gbm_entryzone_delta=-0.009, ab_logistic_delta_auc=+0.006, ab_logistic_entryzone_delta=+0.005, run8_slope=0.759, run8_n_grad_in_enter=30, run8_ci_low=0.836}
+decision=note
+rationale=Dead-feature cleanup. (a) smart_money_present DROPPED outright — it
+required a curated profitable-wallet set that does not exist; labelling "smart"
+from realized PnL would be target leakage. It was 100% NaN (imputed to median),
+contributing only noise + false completeness. (b) top_holder_share was 100% NaN
+(no holder snapshot) but is reconstructable as-of from the swap stream with zero
+new RPC: per swap, infer token amount = sol_amount / curve_price_per_token(
+vsol_after), sum per wallet (buys add, sells subtract, negatives clamped to 0),
+share = max holding / total positive holdings. Wired into model.featurize (no
+lookahead — only swaps with ts<=as_of). It HAS univariate signal: graduates are
+far less concentrated (median 0.443) than non-graduates (0.725), univariate
+AUC 0.667 — economically sensible (one whale = fragile/rug-prone). BUT a
+controlled A/B on identical data (same snapshot frame, toggle the column) shows
+it is REDUNDANT: marginal time-ordered OOS AUC delta is +/-0.005-0.009 (noise),
+slightly NEGATIVE for gbm. The signal is already carried by n_unique_wallets /
+sol_per_human_wallet / bot_trade_share (one whale => few wallets => low
+SOL/human). By the "a feature must prove OOS lift to earn its place" rule it does
+NOT make the active FEATURE_COLUMNS — but featurize still computes it (cheap,
+tested, documented) so re-adding is one line if a future interacting feature
+appears. Model refit on the cleaned 15-feature set; refit auto-selected gbm
+(time-ordered OOS AUC 0.641 > logistic 0.623). latest.pkl updated (takes effect
+on next monitor restart; running PID 211232 keeps its in-memory model until
+then). Clean-window backtest run #8 on the cleaned set: n_grad_in_enter just
+reached 30 (gate >=30) as data accumulated, but reliability slope 0.759 is now
+the lone sub-band criterion (was n_grad). Criteria are jittering near the
+boundary at this sample size; gate remains DEFERRED pending a stable
+clean-window run with slope in [0.8,1.2] AND n_grad_in_enter comfortably >30.

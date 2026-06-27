@@ -548,9 +548,9 @@ def load_examples_from_store(
     Phase 2.2 creator features are wired here via :meth:`Store.creator_history_index`
     — each example carries a :class:`CreatorHistory` built from the creator's
     *prior* outcomes (no lookahead: only outcomes known before this token's
-    first swap ts count). ``top_holder_share`` and ``smart_money_present``
-    remain NaN (need a holder-snapshot source not yet built); the imputer
-    handles them.
+    first swap ts count). ``top_holder_share`` is reconstructed as-of inside
+    :func:`model.featurize` from the swap stream itself (no holder snapshot
+    needed); ``smart_money_present`` was dropped (see DECISIONS.md).
 
     ``holdout_start_ts``: when set, tokens whose first swap ts is >= this value
     are *excluded* — they belong to the locked holdout (charter §9.1) and must

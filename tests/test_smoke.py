@@ -1316,7 +1316,6 @@ def test_model_fit_uses_platt_below_isotonic_threshold():
             "creator_graduated_count": float("nan"),
             "creator_rugged_count": float("nan"),
             "top_holder_share": float("nan"),
-            "smart_money_present": float("nan"),
             "direct_call_share": float("nan"),
             "n_entry_programs": float("nan"),
             "graduated": int(grad),
@@ -1367,8 +1366,7 @@ def test_refit_time_ordered_cv_trains_on_earlier_tests_on_later():
                 "creator_graduated_count": float("nan"),
                 "creator_rugged_count": float("nan"),
                 "top_holder_share": float("nan"),
-                "smart_money_present": float("nan"),
-                "direct_call_share": float("nan"),
+                    "direct_call_share": float("nan"),
                 "n_entry_programs": float("nan"),
                 "graduated": int(mi % 2 == 0),  # alternating labels
                 "mint": f"m{mi}",

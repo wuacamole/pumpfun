@@ -24,14 +24,18 @@ Feature set (the paper's conditioning variables, plus Phase 2.2 additions)
   bot_trade_share, sol_per_human_wallet, net_sol_per_swap,
   n_swaps, n_unique_wallets, n_unique_human_wallets, seconds_since_launch,
   sol_per_min (momentum),
-  creator_graduated_count,    # Phase 2.2 — needs creator-history join
-  creator_rugged_count,       # Phase 2.2 — needs creator-history join
-  top_holder_share,           # Phase 2.2 — needs holder snapshot
-  smart_money_present,        # Phase 2.2 — needs a smart-money wallet set
+  creator_graduated_count,    # Phase 2.2 — creator-history join
+  creator_rugged_count,       # Phase 2.2 — creator-history join
 
-The creator/holder features are only emitted when the optional join data is
-passed in; otherwise they're NaN and the model handles missingness natively
-(GBM: NaN-aware; logistic: imputed with median + missingness indicator).
+featurize() also computes ``top_holder_share`` (reconstructed as-of from the
+swap stream), but it is NOT in the active FEATURE_COLUMNS: a controlled A/B
+showed it is redundant with the existing wallet-distribution features (~0
+marginal OOS AUC). ``smart_money_present`` was dropped outright (no honest data
+source). See DECISIONS.md.
+
+The creator features are only emitted when the optional join data is passed in;
+otherwise they're NaN and the model handles missingness natively (GBM: NaN-aware;
+logistic: imputed with median + missingness indicator).
 
 IMPORTANT — no lookahead
 ------------------------
@@ -49,8 +53,8 @@ import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 
-# The creator/holder features (creator_graduated_count, top_holder_share, …) are
-# intentionally all-NaN until the join data exists; SimpleImputer warns once per
+# The creator features (creator_graduated_count, creator_rugged_count) are NaN
+# until the creator-history join data exists; SimpleImputer warns once per
 # predict, which floods the live monitor log. Silence that specific message only.
 warnings.filterwarnings(
     "ignore", message="Skipping features without any observed values"
@@ -66,6 +70,7 @@ from sklearn.metrics import brier_score_loss
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
+from config import curve_price_per_token
 from conviction_engine import (
     Swap,
     _real_sol_target,
@@ -91,8 +96,16 @@ FEATURE_COLUMNS: list[str] = [
     "sol_per_min",
     "creator_graduated_count",
     "creator_rugged_count",
-    "top_holder_share",
-    "smart_money_present",
+    # top_holder_share is reconstructed as-of in featurize() and IS measured, but
+    # it is intentionally NOT in the active feature set: a controlled A/B on
+    # identical data (DECISIONS.md, [model] entry) showed it has univariate
+    # signal (AUC 0.667 — graduates are less concentrated) yet adds ~0 marginal
+    # OOS AUC (±0.005-0.009; slightly negative for gbm). The concentration
+    # signal is already carried by n_unique_wallets / sol_per_human_wallet /
+    # bot_trade_share. Re-add this line if a future feature interacts with it.
+    # smart_money_present was dropped outright — it needed a curated
+    # profitable-wallet set that doesn't exist and would invite target leakage
+    # if labelled from outcomes.
     # Phase 2.2a — on-chain bot flag (is_direct) + route diversity. These use
     # the real instruction-stack classification (zero RPC, parsed from logs),
     # not the size-heuristic via_frontend. validate_conviction.py showed
@@ -112,8 +125,6 @@ class CreatorHistory:
 
     creator_graduated_count: float = float("nan")
     creator_rugged_count: float = float("nan")
-    top_holder_share: float = float("nan")
-    smart_money_present: float = float("nan")
 
 
 def featurize(
@@ -172,6 +183,27 @@ def featurize(
     entry_programs = {s.entry_program for s in seen if s.entry_program}
     n_entry_programs = float(len(entry_programs)) if entry_programs else float("nan")
 
+    # top_holder_share — concentration of token holdings in the single largest
+    # wallet, reconstructed as-of from the swap stream (no holder-snapshot RPC).
+    # Per swap, infer token amount from the SOL paid and the bonding-curve price
+    # at that point (curve_price_per_token uses vsol_after, the post-trade price
+    # — a close approximation; intra-swap slippage and the 1% fee are ignored).
+    # Buys add to a wallet's net holdings, sells subtract; wallets that net
+    # negative (sold more than we observed them buy — e.g. acquired before the
+    # tracked window) are clamped to 0. Share = max holding / total positive
+    # holdings. NaN until at least one positive holder exists. No lookahead:
+    # only ``seen`` (ts <= as_of) swaps contribute.
+    holdings: dict[str, float] = {}
+    for s in seen:
+        price = curve_price_per_token(s.vsol_after)
+        if price <= 0:
+            continue
+        toks = s.sol_amount / price
+        holdings[s.wallet] = holdings.get(s.wallet, 0.0) + (toks if s.is_buy else -toks)
+    positive = [h for h in holdings.values() if h > 0]
+    total_held = sum(positive)
+    top_holder_share = (max(positive) / total_held) if total_held > 0 else float("nan")
+
     return {
         "vsol": vsol,
         "real_sol_bonded": real_sol_bonded,
@@ -186,8 +218,7 @@ def featurize(
         "sol_per_min": sol_per_min,
         "creator_graduated_count": c.creator_graduated_count,
         "creator_rugged_count": c.creator_rugged_count,
-        "top_holder_share": c.top_holder_share,
-        "smart_money_present": c.smart_money_present,
+        "top_holder_share": top_holder_share,
         "direct_call_share": direct_call_share,
         "n_entry_programs": n_entry_programs,
     }

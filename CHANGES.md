@@ -456,3 +456,22 @@ all three layers.
   (2.9x lift), +111.2% mean return, reliability slope 0.857 (now in the
   [0.8,1.2] band), bootstrap CI low +76.2%, jackknife positive, fold stable.
   4 of 5 §5.4 criteria pass; n_grad_in_enter=25 (<30) is the lone blocker.
+
+### Dead-feature cleanup — `smart_money_present` dropped, `top_holder_share` measured
+
+- **`smart_money_present`:** removed. It was 100% NaN (no data source) and a
+  curated "profitable wallet" set would be target leakage if labelled from
+  outcomes. Pure imputation noise + false completeness — gone from
+  `FEATURE_COLUMNS`, `CreatorHistory`, and `featurize`.
+- **`top_holder_share`:** was 100% NaN; now **reconstructed as-of from the swap
+  stream** in `model.featurize` (zero new RPC) — per swap, token amount inferred
+  from `sol_amount / curve_price_per_token(vsol_after)`, summed per wallet
+  (buys add / sells subtract / negatives clamped), share = max / total. No
+  lookahead (only `ts <= as_of`).
+- **Measured, then excluded from the active set.** Univariate AUC 0.667
+  (graduates less concentrated: median 0.44 vs 0.73). But a controlled A/B on
+  identical data shows ~0 marginal OOS AUC (±0.005–0.009; slightly negative for
+  gbm) — the signal is redundant with `n_unique_wallets` /
+  `sol_per_human_wallet` / `bot_trade_share`. Per the "must prove OOS lift"
+  rule it's kept computed (tested, documented) but not in `FEATURE_COLUMNS`.
+- Model refit on the cleaned 15-feature set (auto-selected gbm). See DECISIONS.md.
