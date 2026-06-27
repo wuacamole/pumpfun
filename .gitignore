@@ -30,3 +30,5 @@ backtest_old_features.json
 backtest_old_model.json
 backtest_postfix_clean.json
 backtest_runs.jsonl
+backtest_cli_clean.json
+backtest_postfix_clean_rerun.json

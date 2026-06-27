@@ -37,6 +37,7 @@ def cmd_backtest(args: argparse.Namespace) -> int:
               "This is a single-shot evaluation; re-running voids the pre-registration.")
     examples, graduation_prices, stop_exit_multiples = load_examples_from_store(
         args.db, holdout_start_ts=holdout,
+        min_first_seen_ts=args.min_first_seen_ts,
     )
     if not examples:
         print(f"no labelled tokens in {args.db} — collect data first")
@@ -46,6 +47,7 @@ def cmd_backtest(args: argparse.Namespace) -> int:
         "fold_size": args.fold_size,
         "kind": args.kind,
         "n_examples": len(examples),
+        "min_first_seen_ts": args.min_first_seen_ts,
     }
     run_num = record_backtest_run(config)
     print(f"running walk-forward backtest on {len(examples)} labelled tokens...")
@@ -156,6 +158,12 @@ def main() -> None:
     b.add_argument("--decision-every", type=float, default=30.0)
     b.add_argument("--fold-size", type=int, default=50)
     b.add_argument("--kind", default="gbm", choices=["gbm", "logistic"])
+    b.add_argument(
+        "--min-first-seen-ts", type=float, default=None,
+        help="exclude tokens whose first swap ts is before this value — the "
+             "post-dedup-fix floor for the clean-window backtest (DECISIONS "
+             "runs #6/#7). Use 1782517950 for the current post-fix window.",
+    )
     b.add_argument(
         "--holdout-eval", action="store_true",
         help="evaluate on the locked holdout (charter §5.4; single-shot; "

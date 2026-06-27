@@ -529,6 +529,7 @@ def load_examples_from_store(
     store_db: str | Path,
     *,
     holdout_start_ts: float | None = None,
+    min_first_seen_ts: float | None = None,
 ) -> tuple[
     list[tuple[str, list[Swap], str, CreatorHistory | None]],
     dict[str, dict[str, object]],
@@ -556,6 +557,12 @@ def load_examples_from_store(
     not enter training/selection. This is the fence that prevents the holdout
     from being consumed silently. The §5.4 gate evaluates on those tokens via a
     separate, single-shot command.
+
+    ``min_first_seen_ts``: when set, tokens whose first swap ts is < this value
+    are *excluded*. This is the post-dedup-fix floor used by the clean-window
+    backtest (DECISIONS runs #6/#7) — pre-fix tokens carry receipt-time-
+    duplicated swaps that inflate per-token features and must not be cited as
+    gate evidence. Replaces the ad-hoc in-memory filter scripts those runs used.
     """
     from model import CreatorHistory
     from storage import Store
@@ -587,6 +594,8 @@ def load_examples_from_store(
             continue
         if holdout_start_ts is not None and swaps[0].ts >= holdout_start_ts:
             continue  # holdout — not for training/selection
+        if min_first_seen_ts is not None and swaps[0].ts < min_first_seen_ts:
+            continue  # pre-fix contaminated window — exclude from clean run
         # No-lookahead creator history: count this creator's resolved outcomes
         # whose outcome_ts precedes this token's first swap. A creator whose
         # earlier token graduated at ts=200 must not contribute to a token

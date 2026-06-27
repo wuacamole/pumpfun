@@ -127,3 +127,40 @@ to be statistically meaningful. The reliability slope 0.460 is well below
 deferred: need ~3 more days of clean collection (~1000 post-fix graduates)
 for n_grad_in_enter to clear 30 and the calibration to tighten. Monitor
 restarted (PID 211232) collecting clean data.
+
+[2026-06-27] [run] author=system
+data_hash=pumpfun.db (post-fix-only: first_seen_ts >= 1782517950, clean data; +58 labelled tokens since run #6)
+backtest_runs_to_date=6 (ad-hoc script — not counted; superseded by the cli run below)
+metrics={n_tokens=1304, base_rate=0.102, n_enter=72, enter_hit_rate=0.278, enter_mean_return=0.938, brier=0.0559, pr_auc=0.3458, reliability_slope=0.917, bootstrap_ci_low=0.588, jackknife_positive=True, n_grad_in_enter=20, fold_stability=True}
+decision=note
+rationale=Re-run of the clean-window backtest (run #6 method: same first_seen_ts
+floor, logistic, decision_every=30s, fold_size=50) on current data. Run via an
+ad-hoc script (NOT counted in backtest_runs_to_date) because, at the time,
+load_examples_from_store had no post-fix floor arg — only holdout_start_ts. That
+reproducibility gap is now fixed: a --min-first-seen-ts flag was added to
+cli.py backtest + load_examples_from_store, so this clean-window run is now a
+first-class, auto-logged cli command (see the author=cli entry immediately
+below, which reproduces this run and IS counted). Headline change is calibration:
+reliability slope moved 0.460 -> 0.917, now INSIDE the §5.4 [0.8,1.2] band (the
+few-positives overestimation resolved as more labelled tokens accumulated).
+PR-AUC improved 0.2523 -> 0.3458. The model now ENTERs more (22 -> 72), so
+n_grad_in_enter rose 8 -> 20 (still < 30 gate); ENTER hit rate eased
+36.4% -> 27.8% and mean return +130.9% -> +93.8% as more marginal ENTERs
+entered, but still a 2.7x lift over the 10.2% base with bootstrap CI low
++58.8%, jackknife positive, fold stable. Four of five §5.4 criteria now pass;
+only n_grad_in_enter remains short. Gate still deferred — keep collecting;
+~10 more clean graduates landing in the ENTER zone should clear it.
+Monitor still PID 211232.
+
+[2026-06-27] [run] author=cli
+data_hash=—   backtest_runs_to_date=6
+metrics={"n_tokens": 1346, "n_enter": 78, "enter_hit_rate": 0.32051282051282054, "enter_mean_return": 1.1117090932749927, "brier": 0.054786871368707524}
+decision=note   rationale=backtest run #6 with config {'decision_every': 30.0, 'fold_size': 50, 'kind': 'logistic', 'n_examples': 1346, 'min_first_seen_ts': 1782517950.0}
+  Full §5.4 metrics (auto-logger stores only 5): base_rate=0.109,
+  enter_hit_rate=0.321 (2.9x lift), enter_mean_return=+111.2%, pr_auc=0.3495,
+  reliability_slope=0.857 (IN [0.8,1.2] band), bootstrap_ci_low=+76.2% (>0),
+  jackknife_positive=True, n_grad_in_enter=25 (gate >=30 — still short),
+  fold_stability=True. First clean-window run via the new --min-first-seen-ts
+  flag (reproducible + counted). 4 of 5 gate criteria pass; n_grad_in_enter=25
+  is the lone blocker and is climbing (20 -> 25). Gate deferred pending ~5 more
+  clean graduates in the ENTER zone.

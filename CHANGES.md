@@ -436,3 +436,23 @@ all three layers.
   parameters: slope + intercept) when `n_positives < 1000`, and
   `method="isotonic"` only once the positive class is large enough for the
   step function to be well-constrained. Charter §5.2 allows either method.
+
+## Tier 3 — reproducibility & audit
+
+### `--min-first-seen-ts` flag for the clean-window backtest
+
+- **Problem:** the gate-relevant clean-window backtests (DECISIONS runs #6/#7
+  — pre-dedup-fix contaminated tokens excluded) were run via ad-hoc in-memory
+  filter scripts because `load_examples_from_store` only had a
+  `holdout_start_ts` (which *excludes* recent tokens), not a post-fix *floor*.
+  That violated CHARTER §9.2: the runs that decide the §5.4 gate weren't
+  reproducible and weren't auto-logged/counted.
+- **Fix:** added a `min_first_seen_ts` parameter to `load_examples_from_store`
+  (excludes tokens whose first swap ts is below the floor) and a
+  `--min-first-seen-ts` flag to `cli.py backtest`. The clean-window run is now
+  a first-class CLI command that auto-logs to DECISIONS.md and increments
+  `backtest_runs_to_date`. The floor is also recorded in the run config.
+- Run #6 (cli, reproducible): n_tokens=1346, ENTER hit 32.1% vs 10.9% base
+  (2.9x lift), +111.2% mean return, reliability slope 0.857 (now in the
+  [0.8,1.2] band), bootstrap CI low +76.2%, jackknife positive, fold stable.
+  4 of 5 §5.4 criteria pass; n_grad_in_enter=25 (<30) is the lone blocker.
