@@ -64,6 +64,7 @@ from helius import HeliusClient, PumpLogsFeed  # noqa: E402
 from model import CreatorHistory, FittedModel, ModelStore, predict_grad_prob  # noqa: E402
 from monitor import AlertStream, Dashboard, DecisionEvent, OpenPositionView, PnlEvent  # noqa: E402
 from paper_trade import PaperBroker  # noqa: E402
+from curve_momentum import CurveMomentumPaper, load_smart_wallets  # noqa: E402
 from storage import Store  # noqa: E402
 
 try:
@@ -305,20 +306,22 @@ def _pool_price_from_tx(tx: dict[str, Any], mint: str) -> float | None:
     if PUMP_SWAP_PROGRAM_ID not in keystrs:
         return None
     post = (tx.get("meta", {}) or {}).get("postTokenBalances") or []
-    by_owner: dict[str, dict[str, float]] = {}
-    for b in post:
-        owner, m = b.get("owner"), b.get("mint")
-        if owner and m in (mint, WRAPPED_SOL_MINT):
-            amt = b.get("uiTokenAmount", {}).get("uiAmount") or 0.0
-            by_owner.setdefault(owner, {})[m] = amt
-    pairs = [
-        (d[mint], d[WRAPPED_SOL_MINT])
-        for d in by_owner.values()
-        if d.get(mint, 0) > 0 and d.get(WRAPPED_SOL_MINT, 0) > 0
-    ]
-    if not pairs:
+    # The pool's base vault and WSOL vault have DIFFERENT owners in PumpSwap, so
+    # we can't require a single owner to hold both legs (that was the old bug —
+    # confirmed 2026-06-28: WSOL is present but under a different owner than the
+    # base vault, so the same-owner pairing found nothing). Instead take the
+    # largest base balance and the largest WSOL balance independently: the pool
+    # vaults dwarf any trader who transiently holds a leg, and _price_is_plausible
+    # rejects the rare mis-pair. (Coverage is still discovery-limited — the mint's
+    # own signatures don't always surface a PumpSwap swap; the durable fix is
+    # pool-address-based signature discovery.)
+    base_amts = [b.get("uiTokenAmount", {}).get("uiAmount") or 0.0
+                 for b in post if b.get("mint") == mint]
+    wsol_amts = [b.get("uiTokenAmount", {}).get("uiAmount") or 0.0
+                 for b in post if b.get("mint") == WRAPPED_SOL_MINT]
+    if not base_amts or not wsol_amts:
         return None
-    base, wsol = max(pairs, key=lambda x: x[0])  # pool = largest base holder
+    base, wsol = max(base_amts), max(wsol_amts)
     return wsol / base if base > 0 and wsol > 0 else None
 
 
@@ -380,8 +383,21 @@ def _gc(now: float, store: Store | None = None, force: bool = False) -> list[str
         last = HISTORY[mint][-1].ts if HISTORY[mint] else 0
         graduated = bool(HISTORY[mint]) and HISTORY[mint][-1].vsol_after >= grad_vsol
         if now - last > STALE_AFTER_SEC or graduated:
-            if graduated and store is not None:
-                store.set_outcome(mint, "graduated", outcome_ts=now)
+            if store is not None:
+                if graduated:
+                    store.set_outcome(mint, "graduated", outcome_ts=now)
+                else:
+                    # Full-population stall labelling (Charter I3): every token
+                    # the monitor evicts for inactivity — not just paper-entered
+                    # ones — is recorded as stalled, so the training set's negative
+                    # class isn't the selected entered subset. only_if_unknown so a
+                    # later resurrection→graduation isn't clobbered. outcome_ts is
+                    # the earliest confirmable moment (last activity + the stale
+                    # window), not wall-clock now, for reproducible no-lookahead.
+                    store.set_outcome(
+                        mint, "stalled",
+                        outcome_ts=last + STALE_AFTER_SEC, only_if_unknown=True,
+                    )
             HISTORY.pop(mint, None)
             LAUNCH_TS.pop(mint, None)
             LAST_SCORE_AT.pop(mint, None)
@@ -405,13 +421,21 @@ async def run(
     try:
         fitted = model_store.load(model_name)
         ez = getattr(fitted, "entry_zone_auc", float("nan"))
-        validated = ez > 0.5
+        econ_ok = getattr(fitted, "economic_gate_passed", False)
+        validated = ez > 0.5 and econ_ok
         print(f"loaded fitted model: kind={fitted.kind} brier={fitted.brier_score:.4f} "
-              f"entry_zone_auc={ez:.3f}")
+              f"entry_zone_auc={ez:.3f} economic_gate_passed={econ_ok}")
         if not validated:
-            print("  WARNING: model has no validated entry-zone discrimination "
-                  "(entry_zone_auc <= 0.5 or absent) — ENTER gate is DISABLED "
-                  "(WATCH-only). See DECISIONS.md [kill] (vSol confound).")
+            if not (ez > 0.5):
+                print("  WARNING: model has no validated entry-zone discrimination "
+                      "(entry_zone_auc <= 0.5 or absent) — ENTER gate is DISABLED "
+                      "(WATCH-only). See DECISIONS.md [kill] (vSol confound).")
+            else:
+                print("  WARNING: model ranks graduations (entry_zone_auc > 0.5) but "
+                      "has NOT passed the ECONOMIC gate (measured-win-side CI-low > 0) "
+                      "— ENTER gate is DISABLED (WATCH-only). Graduations exit at a "
+                      "loss on real prices; ranking them is not an edge. See "
+                      "DECISIONS.md [kill] winside-bracket 2026-06-28.")
     except FileNotFoundError:
         print("no fitted model on disk — using hand-built heuristic (Phase 1 mode); "
               "ENTER gate DISABLED (WATCH-only) until a validated model is trained")
@@ -470,6 +494,34 @@ async def run(
         broker.graduation_price_lookup = lambda m: _broker_graduation_price(m, store)
         print(f"paper broker restored: bankroll={broker.bankroll:.3f} SOL, "
               f"{len(broker.positions)} open positions carried over")
+
+    # ---- Curve-momentum paper strategy: forward paper-test of the validated edge
+    # (DECISIONS [model] curve-momentum / -oos / -execstress / -drawdown / -modelsel).
+    # SEPARATE from PaperBroker (which trades the killed graduation strategy): it enters
+    # model-top-50% entry-zone tokens and exits on the LIQUID bonding curve at
+    # TP5x/SL0.3x/grad/time, sidestepping the [kill] liquidity wall. PAPER ONLY, no
+    # capital. Realized returns are appended to cm_trades.jsonl for OOS-vs-forward
+    # (regime) comparison. Runs only with a fitted model (needs P(grad) scores).
+    _smart = load_smart_wallets() if (paper and fitted is not None) else set()
+    cm = CurveMomentumPaper(smart_wallets=_smart) if (paper and fitted is not None) else None
+    if cm is not None:
+        print(f"curve-momentum paper strategy ACTIVE: size={cm.size_sol} SOL, "
+              f"score_min={cm.score_min}, scale-out {cm.first_frac:.0%}@{cm.first_mult}x "
+              f"runner->{cm.tp_mult}x/breakeven, hard-SL {cm.sl_mult}x, "
+              f"smart-wallets={len(cm.smart)} (sells logged only) -> cm_trades.jsonl")
+
+    def _log_cm_trade(t) -> None:
+        with open("cm_trades.jsonl", "a") as f:
+            f.write(json.dumps({
+                "mint": t.mint, "entry_ts": t.entry_ts, "exit_ts": t.exit_ts,
+                "entry_vsol": t.entry_vsol, "exit_vsol": t.exit_vsol,
+                "size_sol": t.size_sol, "ret": t.ret, "reason": t.reason,
+                "model_score": t.model_score, "velocity": t.velocity,
+                "smart_buys": t.smart_buys, "smart_sells": t.smart_sells}) + "\n")
+        import sys
+        print(f"[CM {t.reason}] {t.mint[:8]}.. ret {t.ret:+.1%} "
+              f"(vSol {t.entry_vsol:.0f}->{t.exit_vsol:.0f}, score {t.model_score:.3f})",
+              file=sys.stderr, flush=True)
     # In dashboard mode, the rich panel owns stdout — silence the alert stream's
     # competing prints (it still writes to alerts.log). Wire the auto-de-risk
     # callback so calibration drift halts the paper broker (charter §8).
@@ -592,6 +644,20 @@ async def run(
         HISTORY[mint].append(sw)
         store.log_swap(sw, mint, source=source, signature=signature)
         stats.n_swaps_total += 1
+
+        # Curve-momentum forward paper-test: feed every swap. The strategy scores the
+        # model lazily ONLY at its entry trigger (first vSol>=36, caught clean) and
+        # manages curve exits itself. A returned trade is a TP/SL/time close.
+        if cm is not None:
+            hist = HISTORY[mint]
+            def _cm_score(_h=hist, _ts=sw.ts):
+                try:
+                    return predict_grad_prob(fitted, _h, as_of=_ts)
+                except Exception:
+                    return None
+            cm_trade = cm.on_swap(mint, sw, score_fn=_cm_score)
+            if cm_trade is not None:
+                _log_cm_trade(cm_trade)
 
         # Paper-trade exit checks, throttled (not per-swap): rebuilding the
         # vsol map over all tracked mints on every event was O(mints)/swap and
@@ -741,6 +807,10 @@ async def run(
                 # price (charter I2), not a flat 5x placeholder. Non-blocking
                 # on failure — the broker falls back to the default multiple.
                 await _record_graduation_price(mint, now, helius, store, pc)
+                if cm is not None:                     # graduation: close CM on the curve
+                    ct = cm.force_close(mint, now, reason="grad")
+                    if ct is not None:
+                        _log_cm_trade(ct)
                 if broker is not None and mint in broker.positions:
                     closed = broker.on_graduated(mint, now)
                     if closed:
@@ -806,7 +876,12 @@ async def run(
                 continue
             _handle_swap(mint, sw, now, source="helius", signature=sig)
             if int(now) % 30 == 0 or len(HISTORY) > MAX_TOKENS:
-                _gc(now, store, force=(len(HISTORY) > MAX_TOKENS))
+                dropped = _gc(now, store, force=(len(HISTORY) > MAX_TOKENS))
+                if cm is not None:
+                    for dm in dropped:                 # evicted stale token: close on curve
+                        ct = cm.force_close(dm, now)
+                        if ct is not None:
+                            _log_cm_trade(ct)
                 _refresh_creator_index(now)
             # Periodic feed-health line: decode/fetch split (credit use) + drops
             # (consumer falling behind the firehose). n_dropped > 0 growing means
@@ -837,9 +912,45 @@ async def run(
                 dash.tick()
         tick_task = asyncio.create_task(_tick()) if dashboard else None
 
+        async def _helius_interval_runner() -> None:
+            """Credit-saving duty cycle: connect the firehose for ON seconds, then
+            disconnect and idle until the next PERIOD boundary. Enabled when
+            HELIUS_INTERVAL_ON_SEC > 0 (default 0 = continuous). NOTE: curve-momentum
+            paper P&L is NOT meaningful in this mode — positions dangle across the
+            off-gap and tokens are seen mid-trajectory — so interval data is for
+            base-rate/population + training collection, not the §5.4 holdout."""
+            import sys, time as _time, json as _json
+            on = float(os.environ.get("HELIUS_INTERVAL_ON_SEC", "0") or 0)
+            period = float(os.environ.get("HELIUS_INTERVAL_PERIOD_SEC", "3600") or 3600)
+            while True:
+                print(f"[interval] firehose ON for {on:.0f}s", file=sys.stderr, flush=True)
+                w_start = _time.time()
+                t = asyncio.create_task(_helius_logs_feed())
+                await asyncio.sleep(on)
+                t.cancel()
+                try:
+                    await t
+                except (asyncio.CancelledError, Exception):
+                    pass
+                # Record the exact ON-window [start, end] so the forward-test gap
+                # filter (_chk.py) can drop trades whose lifetime spanned a blackout
+                # (those exits are path-blind, not real strategy outcomes).
+                try:
+                    with open("interval_windows.jsonl", "a") as _wf:
+                        _wf.write(_json.dumps({"start": w_start, "end": _time.time()}) + "\n")
+                except Exception:
+                    pass
+                off = max(period - on, 0.0)
+                print(f"[interval] firehose OFF for {off:.0f}s", file=sys.stderr, flush=True)
+                await asyncio.sleep(off)
+
         tasks = [asyncio.create_task(_pumpportal_creates())]
         if use_logs_feed:
-            tasks.append(asyncio.create_task(_helius_logs_feed()))
+            interval_on = float(os.environ.get("HELIUS_INTERVAL_ON_SEC", "0") or 0)
+            if interval_on > 0:
+                tasks.append(asyncio.create_task(_helius_interval_runner()))
+            else:
+                tasks.append(asyncio.create_task(_helius_logs_feed()))
         await asyncio.gather(*tasks)
     finally:
         if tick_task is not None:
@@ -897,9 +1008,18 @@ def _maybe_score(
     # saved before the metric existed, or no model at all — the gate abstains
     # (WATCH-only). See DECISIONS.md [kill] (vSol confound): a model that can't
     # rank at fixed vSol must not bet.
+    # ENTER requires BOTH: (1) entry-zone discrimination (entry_zone_auc > 0.5),
+    # and (2) a passed ECONOMIC gate — a backtest valued at the MEASURED PumpSwap
+    # exit distribution showing positive post-cost return (CI-low > 0). (1) alone
+    # is insufficient: a model can rank graduations perfectly and still lose money
+    # because most graduations exit at a loss (DECISIONS [kill] winside-bracket
+    # 2026-06-28). economic_gate_passed defaults False, so an unvalidated or
+    # placeholder-validated model abstains (WATCH-only) until the win side is
+    # proven profitable on real prices.
     enter_validated = (
         fitted is not None
         and getattr(fitted, "entry_zone_auc", float("nan")) > 0.5
+        and getattr(fitted, "economic_gate_passed", False)
     )
     if fitted is not None:
         try:

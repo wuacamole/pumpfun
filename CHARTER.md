@@ -247,11 +247,39 @@ Fill this in, commit it with a git hash, and **do not edit it after looking at t
 holdout** (editing = §9.3, burns the holdout). This is the contract with your
 future self.
 
+> **STATUS: PREPARED, NOT ACTIVE (2026-06-29).** The holdout span below is a
+> placeholder. No holdout is fenced (`HOLDOUT_START_TS = None`) because a valid
+> curve-momentum holdout needs a CONTINUOUS ≥2-week capture, which the current
+> interval-collection budget can't fund (interval capture misses full token
+> trajectories → no usable holdout). When a funded continuous window is collected,
+> set `HOLDOUT_START_TS` to its start, fill the real span + commit hash below,
+> freeze, and evaluate once. The hypothesis / entry / exit / thresholds below are
+> frozen now so they can't be retrofitted to the holdout later.
+
 ```
-PRE-REGISTRATION — frozen YYYY-MM-DD, commit <hash>
-Hypothesis (verbatim from §4): …………………………………………………
-Entry rule (exact, code-referenced): ………………………………………
-Holdout span (timestamps): …………  →  …………   [fenced in config: …]
+PRE-REGISTRATION — spec frozen 2026-06-29 21:20 UTC; holdout span TBD (not yet collectable)
+Hypothesis (§9 amendment to the killed §4 graduation thesis): a PRE-GRADUATION
+  curve-momentum edge exists. Tokens caught clean (first vSol < 32) that climb to
+  the entry trigger have positive post-cost expectancy when exited ON THE LIQUID
+  BONDING CURVE before graduation — sidestepping the dead post-grad PumpSwap pool
+  that killed the graduation strategy.
+Entry rule (exact, code-referenced — curve_momentum.py): ENTER one decision per
+  mint at the first swap with vSol >= ENTRY_VSOL (38.0), gated on caught-clean
+  (first observed vSol < CATCH_VSOL=32.0) AND model_score >= MODEL_SCORE_MIN
+  (0.115, model.py 11-feature de-skewed set). Single decision, no re-entry.
+  [Amended 2026-07-02, BEFORE any holdout was fenced: 0.070 -> 0.115 via the
+  pre-committed trigger written into the 0.070 gate ("tighten to ~0.115 only if
+  the forward test confirms the live lift") — forward n=940 + time-ordered
+  replay + 6-window regime check all confirmed; DECISIONS.md 2026-07-02. No
+  holdout existed, so nothing was burned; this spec re-freezes as of that date.]
+Exit rule (frozen): scale-out — bank FIRST_FRAC=0.5 at FIRST_MULT=1.3x; runner
+  exits at TP_MULT=1.7x or breakeven stop; hard SL_MULT=0.2x only before banking;
+  MAX_HOLD_SEC=3600 time-stop; force-close on graduation at last pre-grad vSol.
+  Smart-sell counter is LOG-ONLY (override demoted 2026-06-30, regime-test drag).
+Costs (conservative, both sides): fee 1% + MEV 1%, exact constant-product impact.
+Holdout span (timestamps): TBD  →  TBD  (>= 2 weeks continuous; NOT collectable
+  under interval budget — fence when a funded continuous window exists)
+  [fenced in config: HOLDOUT_START_TS = None for now]
 Primary gate metric: post-cost mean return per ENTER, 95% bootstrap CI low > 0
 Thresholds:
   N_grad (graduations in entered subset) = 30
@@ -260,9 +288,13 @@ Thresholds:
   predicted vs realized grad rate within  ±20%
   jackknife: positive after removing best trade = required
   fold stability: positive in every final-window fold = required
+  regime coverage: holdout spans >= 2 distinct weeks (>= 1 regime boundary)
 Kill box: 12 weeks live paper OR 500 population graduations, whichever first
-Backtest runs consumed before freeze: <n>   (report at gate)
-Signed: ………………
+Backtest runs consumed before freeze: many (graduation line, runs #1-13+ logged
+  in DECISIONS.md) + curve-momentum dev (peak_exit/slippage/OOS/stress/regime,
+  ~10 scripted runs) — all on the now-fenced PRE-holdout era; reported here for
+  the researcher-DoF penalty (§8). The holdout era is untouched.
+Signed: Claude (research agent), at user direction
 ```
 
 ---

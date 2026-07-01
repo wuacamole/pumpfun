@@ -1225,10 +1225,16 @@ def test_featurize_direct_call_share_and_entry_programs():
     """featurize emits direct_call_share (the real instruction-stack bot flag)
     and n_entry_programs (route diversity) from Swap.is_direct /
     Swap.entry_program. NaN when the feed didn't carry them (PumpPortal path).
+
+    Both were DROPPED from the ACTIVE feature set on 2026-06-29 (train/serve
+    skew: NaN at the live entry snapshot compressed every serving score to the
+    base rate — see the FEATURE_COLUMNS comment block in model.py). featurize
+    still measures them; they just must not be trained on until reliably
+    populated at serving time.
     """
     from model import FEATURE_COLUMNS
-    assert "direct_call_share" in FEATURE_COLUMNS
-    assert "n_entry_programs" in FEATURE_COLUMNS
+    assert "direct_call_share" not in FEATURE_COLUMNS
+    assert "n_entry_programs" not in FEATURE_COLUMNS
     # Swaps with is_direct + entry_program populated (Helius logs-feed path).
     swaps = [
         Swap(ts=0, wallet="w1", is_buy=True, sol_amount=1.0, vsol_after=31.0,

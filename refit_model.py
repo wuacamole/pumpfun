@@ -31,6 +31,16 @@ ENTRY_VSOL = 36.0
 SNAP_EVERY_SEC = 20.0  # sample a decision point this often along the trajectory
 MIN_SWAPS = 5
 MAX_SNAPS = 15         # cap per token so a long-lived token can't dominate
+# Outcome-maturity guard. Exclude tokens whose first swap is within this many
+# seconds of the latest observed swap — their outcome is not yet settled.
+# Graduation labels are real-time (migrate event) but a 'stalled' label is only
+# written when the paper broker times a position out at entry + time_stop_sec
+# (paper_trade.PaperBroker.time_stop_sec = 1800s / 30 min), so the recent cohort
+# is RIGHT-CENSORED: its resolved tokens are fake-graduate-heavy and the model
+# would learn a "launched late => graduates" leak. Buffer = time_stop_sec (1800)
+# + entry-lag/settle cushion (~1800) = 3600. Bump this if time_stop_sec grows.
+# See DECISIONS.md [model] 2026-06-27 (route-feature-test). 0 disables.
+MATURITY_SEC = 3600.0
 GRAD_VSOL = get_cached_constants().v_sol_graduation
 # Minimum entry-zone (33-50 vSol) time-ordered OOS AUC required to deploy a
 # model. <= 0.5 means no discrimination where the live gate fires; refuse to
@@ -42,7 +52,18 @@ def _load_tokens():
     c = sqlite3.connect(DB)
     c.row_factory = sqlite3.Row
     out = []
-    for r in c.execute("SELECT mint,outcome FROM tokens WHERE outcome IN ('graduated','stalled')"):
+    # Right-censoring guard: drop the not-yet-settled recent tail (see MATURITY_SEC).
+    mature_clause = ""
+    params: tuple = ()
+    if MATURITY_SEC:
+        max_ts = c.execute("SELECT MAX(ts) FROM swaps").fetchone()[0]
+        if max_ts is not None:
+            mature_clause = " AND first_seen_ts <= ?"
+            params = (max_ts - MATURITY_SEC,)
+    for r in c.execute(
+        "SELECT mint,outcome FROM tokens WHERE outcome IN ('graduated','stalled')"
+        + mature_clause, params,
+    ):
         swaps = [
             Swap(ts=s["ts"], wallet=s["wallet"], is_buy=bool(s["is_buy"]),
                  sol_amount=s["sol_amount"], vsol_after=s["vsol_after"],

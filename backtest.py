@@ -238,6 +238,7 @@ def run_backtest(
     entry_bot_share_max: float = 0.6,
     graduation_prices: dict[str, dict[str, object]] | None = None,
     stop_exit_multiples: dict[str, dict[str, object]] | None = None,
+    empirical_exit_price: float | None = None,
     max_decisions_per_token: int = 100,
 ) -> BacktestReport:
     """Walk-forward backtest.
@@ -367,6 +368,18 @@ def run_backtest(
                     pm = row.get("payoff_multiple")
                     if isinstance(pm, (int, float)) and pm > 0:
                         payoff_mult = float(pm)
+            # Unpriced graduation: rather than the optimistic flat 5x default,
+            # plug the EMPIRICAL exit price recovered from the priced graduations
+            # (the unbiased mean-return estimator under price-missingness that is
+            # uncorrelated with outcome — the parse-failure is structural, not
+            # outcome-driven). Per-position: empirical exit price over THIS trade's
+            # bonding-curve entry price. Real exits are loss-heavy (median 0.65x),
+            # so this corrects the win side toward the measured truth (charter I2).
+            if (payoff_mult is None and entered and graduated
+                    and empirical_exit_price is not None and empirical_exit_price > 0):
+                entry_price = curve_price_per_token(vsol)
+                if entry_price > 0:
+                    payoff_mult = float(empirical_exit_price) / entry_price
             # Resolve the loss-side exit multiple from the paper broker's logged
             # stop/time-out fill (charter I2, loss side). When the broker closed
             # a real position for this mint, exit_sol/entry_sol is the actual
@@ -564,6 +577,7 @@ def load_examples_from_store(
     *,
     holdout_start_ts: float | None = None,
     min_first_seen_ts: float | None = None,
+    maturity_sec: float | None = None,
 ) -> tuple[
     list[tuple[str, list[Swap], str, CreatorHistory | None]],
     dict[str, dict[str, object]],
@@ -597,11 +611,28 @@ def load_examples_from_store(
     backtest (DECISIONS runs #6/#7) — pre-fix tokens carry receipt-time-
     duplicated swaps that inflate per-token features and must not be cited as
     gate evidence. Replaces the ad-hoc in-memory filter scripts those runs used.
+
+    ``maturity_sec``: when set, tokens whose first swap ts is > (latest observed
+    swap ts − maturity_sec) are *excluded* — their outcome is not yet settled.
+    Graduation labels are real-time (migrate event) but a 'stalled' label is only
+    written when the paper broker times a position out at entry + time_stop_sec
+    (paper_trade.PaperBroker.time_stop_sec = 1800s / 30 min), so the most-recent
+    cohort is RIGHT-CENSORED: its resolved tokens are artificially graduate-heavy
+    (graduation rate by launch hour climbs to a fake 100% in the final hours).
+    Training/eval on that tail learns a "launched late ⇒ graduates" leak. The CLI
+    default is 3600 = time_stop_sec (1800) + entry-lag/settle cushion (~1800);
+    widen it if time_stop_sec grows. See DECISIONS.md [model] 2026-06-27
+    (route-feature-test) for the discovery.
     """
     from model import CreatorHistory
     from storage import Store
     s = Store(store_db, auto_dedupe=False)
     examples: list[tuple[str, list[Swap], str, CreatorHistory | None]] = []
+    max_first_seen_ts: float | None = None
+    if maturity_sec is not None:
+        row = s.conn.execute("SELECT MAX(ts) FROM swaps").fetchone()
+        if row and row[0] is not None:
+            max_first_seen_ts = float(row[0]) - maturity_sec
     # Build the full creator-history index once; we'll filter per-token by the
     # creator's outcomes known before that token's launch. Doing one query per
     # token would be O(tokens) RPCs; this is one scan + an in-memory lookup.
@@ -630,6 +661,8 @@ def load_examples_from_store(
             continue  # holdout — not for training/selection
         if min_first_seen_ts is not None and swaps[0].ts < min_first_seen_ts:
             continue  # pre-fix contaminated window — exclude from clean run
+        if max_first_seen_ts is not None and swaps[0].ts > max_first_seen_ts:
+            continue  # right-censored tail — outcome not yet settled
         # No-lookahead creator history: count this creator's resolved outcomes
         # whose outcome_ts precedes this token's first swap. A creator whose
         # earlier token graduated at ts=200 must not contribute to a token

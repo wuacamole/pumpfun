@@ -72,6 +72,13 @@ TOKEN_DECIMALS = 6
 # To reserve: set this to the unix timestamp of the start of your holdout
 # window, commit it, and do NOT run `cli.py backtest` on data that includes
 # it. The backtest loader (backtest.load_examples_from_store) filters on this.
+# None = no holdout fenced (current state). A real curve-momentum holdout needs a
+# CONTINUOUS >=2-week capture window (interval/duty-cycled capture can't observe
+# full token trajectories, so it yields no valid holdout — see DECISIONS.md
+# 2026-06-29). Under the current interval-collection budget, post-"now" data is
+# TRAINING/base-rate collection, NOT a holdout, so this stays None. The §11
+# pre-registration spec is PREPARED; set this to the start ts of a funded
+# continuous capture window when one is collected, then evaluate once at §5.4.
 HOLDOUT_START_TS: float | None = None
 
 
