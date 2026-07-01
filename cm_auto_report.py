@@ -12,11 +12,12 @@ Benchmark = grinder, BASE frictions (what the live strategy uses): mean ~+11%, w
 """
 from __future__ import annotations
 
-import json
 import time
 from pathlib import Path
 
 import numpy as np
+
+from cm_gap_filter import load_clean_trades
 
 LOG = Path("cm_trades.jsonl")
 OUT = Path("cm_forward_report.log")
@@ -48,14 +49,20 @@ def main() -> None:
         with OUT.open("a") as f:
             f.write(line + "\n")
         return
-    rows = [json.loads(l) for l in LOG.read_text().splitlines() if l.strip()]
+    rows, dropped = load_clean_trades(LOG)
+    if not rows:
+        line = f"[{stamp}] PENDING — no clean CM trades yet ({dropped} blackout-spanning dropped)"
+        print(line)
+        with OUT.open("a") as f:
+            f.write(line + "\n")
+        return
     r = np.array([x["ret"] for x in rows])
     n = len(r)
     win = (r > 0).mean()
     mean = r.mean()
     by_reason = {k: sum(x["reason"] == k for x in rows) for k in sorted({x["reason"] for x in rows})}
     state, why = verdict(r)
-    line = (f"[{stamp}] {state}: n={n} win={win:.0%} mean={mean:+.1%} "
+    line = (f"[{stamp}] {state}: n={n} (+{dropped} gap-dropped) win={win:.0%} mean={mean:+.1%} "
             f"(bench ~{BENCH_MEAN:+.0%}/{BENCH_WIN:.0%}) exits={by_reason} — {why}")
     print(line)
     with OUT.open("a") as f:

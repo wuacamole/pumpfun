@@ -14,11 +14,11 @@ Run: uv run python cm_forward_report.py
 """
 from __future__ import annotations
 
-import json
-import statistics as st
 from pathlib import Path
 
 import numpy as np
+
+from cm_gap_filter import load_clean_trades
 
 LOG = Path("cm_trades.jsonl")
 BENCH_MEAN, BENCH_WIN = 0.12, 0.63  # floor=38 + scale-out 50%@1.3x
@@ -28,9 +28,10 @@ def main() -> None:
     if not LOG.exists():
         print("no cm_trades.jsonl yet — the forward test hasn't closed a trade.")
         return
-    rows = [json.loads(l) for l in LOG.read_text().splitlines() if l.strip()]
+    rows, dropped = load_clean_trades(LOG)
     if not rows:
-        print("cm_trades.jsonl is empty."); return
+        print("cm_trades.jsonl is empty.")
+        return
     r = np.array([x["ret"] for x in rows])
     n = len(r)
     rng = np.random.default_rng(0)
@@ -38,7 +39,8 @@ def main() -> None:
     span_h = (max(x["exit_ts"] for x in rows) - min(x["entry_ts"] for x in rows)) / 3600.0
     by_reason = {k: sum(x["reason"] == k for x in rows) for k in sorted({x["reason"] for x in rows})}
 
-    print(f"FORWARD paper-test (cm_trades.jsonl) — {n} closed trades over {span_h:.1f}h\n")
+    print(f"FORWARD paper-test (cm_trades.jsonl) — {n} closed trades over {span_h:.1f}h"
+          f" ({dropped} blackout-spanning dropped)\n")
     print(f"  mean return   : {r.mean():+.1%}   (in-window benchmark ~{BENCH_MEAN:+.0%})")
     print(f"  bootstrap CI-low: {ci_low:+.1%}   (must be > 0 for a live-positive edge)")
     print(f"  median        : {np.median(r):+.1%}")
