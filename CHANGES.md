@@ -475,3 +475,27 @@ all three layers.
   `sol_per_human_wallet` / `bot_trade_share`. Per the "must prove OOS lift"
   rule it's kept computed (tested, documented) but not in `FEATURE_COLUMNS`.
 - Model refit on the cleaned 15-feature set (auto-selected gbm). See DECISIONS.md.
+
+## Tier 4 — kill the fictional edge (vSol confound)
+
+Investigation found the model's "edge" is a vSol-level artifact, not skill (see
+DECISIONS.md [kill] 2026-06-27). vSol alone scores OOS AUC 0.860; the full model
+0.649 — and within every vSol band it is anti-predictive (entry-zone AUC 0.377,
+95% CI below 0.5). Four fixes:
+
+- **vSol-matched baseline in the backtest** (`backtest.py`): `BacktestReport`
+  gains `vsol_matched_baseline` (P(grad) among decisions at the ENTER set's vSol)
+  and `enter_lift_vs_vsol` (skill net of the vSol confound). The CLI prints both
+  — the headline "ENTER hit vs overall base" can no longer hide the confound.
+  On clean data the honest lift is +7.0pp (33.7% vs 26.7%), not +21pp.
+- **Model selection by entry-zone AUC** (`refit_model.py`): refit ranks models by
+  entry-zone[33-50] OOS AUC (the gate's actual job), not overall AUC (which the
+  trivial vSol signal dominated and which had deployed the *worst* entry-zone
+  model). `ENTRY_ZONE_AUC_DEPLOY_MIN = 0.5`: it **refuses to deploy** a model
+  with no entry-zone discrimination, leaving the previous model on disk.
+- **`FittedModel.entry_zone_auc`** (`model.py`): persisted at refit so consumers
+  can check whether a model is trustworthy where the gate fires.
+- **Live ENTER gate neutered** (`live_monitor.py`): ENTER is allowed only when
+  the loaded model's `entry_zone_auc > 0.5`; otherwise (unvalidated/old/no model)
+  the gate abstains WATCH-only, covering the hand-built path too. Logged at
+  startup.

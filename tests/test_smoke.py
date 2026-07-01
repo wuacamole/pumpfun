@@ -1225,10 +1225,16 @@ def test_featurize_direct_call_share_and_entry_programs():
     """featurize emits direct_call_share (the real instruction-stack bot flag)
     and n_entry_programs (route diversity) from Swap.is_direct /
     Swap.entry_program. NaN when the feed didn't carry them (PumpPortal path).
+
+    Both were DROPPED from the ACTIVE feature set on 2026-06-29 (train/serve
+    skew: NaN at the live entry snapshot compressed every serving score to the
+    base rate — see the FEATURE_COLUMNS comment block in model.py). featurize
+    still measures them; they just must not be trained on until reliably
+    populated at serving time.
     """
     from model import FEATURE_COLUMNS
-    assert "direct_call_share" in FEATURE_COLUMNS
-    assert "n_entry_programs" in FEATURE_COLUMNS
+    assert "direct_call_share" not in FEATURE_COLUMNS
+    assert "n_entry_programs" not in FEATURE_COLUMNS
     # Swaps with is_direct + entry_program populated (Helius logs-feed path).
     swaps = [
         Swap(ts=0, wallet="w1", is_buy=True, sol_amount=1.0, vsol_after=31.0,
@@ -1366,7 +1372,7 @@ def test_refit_time_ordered_cv_trains_on_earlier_tests_on_later():
                 "creator_graduated_count": float("nan"),
                 "creator_rugged_count": float("nan"),
                 "top_holder_share": float("nan"),
-                    "direct_call_share": float("nan"),
+                "direct_call_share": float("nan"),
                 "n_entry_programs": float("nan"),
                 "graduated": int(mi % 2 == 0),  # alternating labels
                 "mint": f"m{mi}",
@@ -1381,3 +1387,54 @@ def test_refit_time_ordered_cv_trains_on_earlier_tests_on_later():
     assert np.all(np.isfinite(oof))
     # Labels are a mix (alternating) — not single-class.
     assert len(set(y.tolist())) == 2
+
+def _mk_score(decision="ENTER", edge=0.20):
+    """Minimal TokenScore for gate tests."""
+    from conviction_engine import TokenScore
+    return TokenScore(
+        mint="m", vsol=45.0, real_sol_bonded=15.0, pct_to_graduation=20.0,
+        n_swaps=10, n_unique_wallets=8, n_unique_human_wallets=5,
+        bot_trade_share=0.3, sol_per_human_wallet=0.1, net_sol_per_swap=0.05,
+        seconds_since_launch=120.0, conviction_score=60.0,
+        breakeven_prob=0.15, estimated_grad_prob=0.35, edge=edge, decision=decision,
+    )
+
+
+def test_live_gate_abstains_when_model_unvalidated():
+    """_rescore_with_model must NOT ENTER when allow_enter=False — a model with
+    no entry-zone discrimination would otherwise bet on the vSol confound."""
+    from live_monitor import _rescore_with_model
+    s = _mk_score()
+    # Strong positive edge, but the model is unvalidated -> WATCH, never ENTER.
+    out = _rescore_with_model(s, est=0.35, edge=0.20, allow_enter=False)
+    assert out.decision == "WATCH"
+    # Same edge with a validated model -> ENTER is allowed.
+    out2 = _rescore_with_model(s, est=0.35, edge=0.20, allow_enter=True)
+    assert out2.decision == "ENTER"
+
+
+def test_refit_deploy_guard_threshold_exists():
+    """The deploy guard constant must gate at 0.5 (no entry-zone discrimination)."""
+    import refit_model as rm
+    assert rm.ENTRY_ZONE_AUC_DEPLOY_MIN == 0.5
+
+
+def test_backtest_report_has_vsol_matched_baseline():
+    """BacktestReport exposes the honest vSol-matched baseline + lift, and
+    write_report serializes them."""
+    import json
+    from backtest import BacktestReport, write_report
+    r = BacktestReport(
+        n_tokens=1, n_decisions=1, n_enter=1, n_watch=0, n_skip=0,
+        enter_hit_rate=0.30, enter_mean_return=0.5, baseline_hit_rate=0.10,
+        brier_score=0.1, edge_over_time=[],
+        vsol_matched_baseline=0.25, enter_lift_vs_vsol=0.05,
+    )
+    assert r.vsol_matched_baseline == 0.25
+    assert r.enter_lift_vs_vsol == 0.05
+    import tempfile, os
+    p = os.path.join(tempfile.gettempdir(), "bt_report_test.json")
+    write_report(r, p)
+    d = json.load(open(p))
+    assert d["vsol_matched_baseline"] == 0.25
+    assert d["enter_lift_vs_vsol"] == 0.05

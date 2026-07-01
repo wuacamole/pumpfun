@@ -33,3 +33,11 @@ backtest_runs.jsonl
 backtest_cli_clean.json
 backtest_postfix_clean_rerun.json
 backtest_cli_clean2.json
+
+# Live-growing runtime records (frozen archives like cm_trades_floor36.jsonl ARE committed)
+cm_trades.jsonl
+cm_forward_report.log
+interval_windows.jsonl
+# Bulky generated reports / one-off backfill dumps
+backtest_report_empirical.json
+backfill_stalled_1782548503.jsonl

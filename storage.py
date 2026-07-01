@@ -220,6 +220,11 @@ class Store:
         # WAL = readers don't block the writer; sane for a single writer.
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA synchronous=NORMAL")
+        # Wait up to 30s for a write lock instead of erroring immediately. WAL
+        # serialises writers, so a second writer (e.g. a backfill/maintenance
+        # script running alongside the live monitor) would otherwise raise
+        # "database is locked" the instant their writes overlap. Default was 0.
+        self.conn.execute("PRAGMA busy_timeout=30000")
         self.conn.executescript(SCHEMA_SWAPS)
         self.conn.executescript(SCHEMA_TOKENS)
         self.conn.executescript(SCHEMA_PAPER)
@@ -522,15 +527,24 @@ class Store:
         outcome: str,
         outcome_ts: float | None = None,
         graduated_at_ts: float | None = None,
+        only_if_unknown: bool = False,
     ) -> None:
-        """Record the terminal state of a token. ``outcome`` must be in OUTCOMES."""
+        """Record the terminal state of a token. ``outcome`` must be in OUTCOMES.
+
+        ``only_if_unknown``: when True, update only if the current outcome is
+        still 'unknown' — a non-clobbering write. Used for full-population
+        ``stalled`` labelling (live `_gc` and the backfill): a token that already
+        graduated, or was already resolved, must not be overwritten by a later
+        stall sweep. 'graduated' is the terminal truth and always wins.
+        """
         if outcome not in OUTCOMES:
             raise ValueError(f"outcome must be one of {OUTCOMES}, got {outcome!r}")
+        where = "WHERE mint = ?" + (" AND outcome = 'unknown'" if only_if_unknown else "")
         self.conn.execute(
-            """UPDATE tokens
+            f"""UPDATE tokens
                  SET outcome = ?, outcome_ts = ?, graduated_at_ts = ?,
                      updated_at = ?
-               WHERE mint = ?""",
+               {where}""",
             (outcome, outcome_ts, graduated_at_ts, time.time(), mint),
         )
 

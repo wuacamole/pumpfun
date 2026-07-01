@@ -94,8 +94,20 @@ FEATURE_COLUMNS: list[str] = [
     "n_unique_human_wallets",
     "seconds_since_launch",
     "sol_per_min",
-    "creator_graduated_count",
-    "creator_rugged_count",
+    # --- DROPPED 2026-06-29: TRAIN/SERVE SKEW -> score compression bug ---
+    # creator_graduated_count, creator_rugged_count, direct_call_share, and
+    # n_entry_programs are 100% NaN at the LIVE entry snapshot (cm _cm_score passes
+    # creator=None; the logs feed doesn't reliably carry is_direct/entry_program at
+    # the first vSol>=38 swap). A gbm trained WITH them learns to lean on those
+    # splits; at serving they impute to the training median and the calibrated
+    # output regresses to the ~6% base rate -> every live score bunches at ~0.06
+    # (diag_score_compression.py: live p50=0.060, 91% <=0.07; a fresh fit WITHOUT
+    # them spreads to p50=0.13, 7% <=0.07, and keeps the OOS selection lift). Using
+    # only features reliably present at serving time removes the skew. Re-add a line
+    # ONLY once that feature is reliably populated at the live entry snapshot AND in
+    # the training frame (build_snapshots passes creator=None today).
+    # "creator_graduated_count",
+    # "creator_rugged_count",
     # top_holder_share is reconstructed as-of in featurize() and IS measured, but
     # it is intentionally NOT in the active feature set: a controlled A/B on
     # identical data (DECISIONS.md, [model] entry) showed it has univariate
@@ -111,9 +123,10 @@ FEATURE_COLUMNS: list[str] = [
     # not the size-heuristic via_frontend. validate_conviction.py showed
     # via_frontend is inverted vs reality (humans trade small, bots graduate);
     # direct_call_share is the signal the paper actually measured. NaN when the
-    # feed didn't carry is_direct (PumpPortal/RPC-backfill paths).
-    "direct_call_share",
-    "n_entry_programs",
+    # feed didn't carry is_direct (PumpPortal/RPC-backfill paths). DROPPED 2026-06-29
+    # (see the train/serve-skew note above) — NaN at the live entry snapshot.
+    # "direct_call_share",
+    # "n_entry_programs",
 ]
 
 LABEL_COL = "graduated"  # 1 if the token graduated, 0 otherwise
@@ -248,6 +261,24 @@ class FittedModel:
     pipeline: Pipeline | CalibratedClassifierCV
     brier_score: float
     feature_columns: list[str] = field(default_factory=lambda: list(FEATURE_COLUMNS))
+    # Entry-zone (33-50 vSol) time-ordered OOS AUC measured at refit time. This
+    # is the only metric that reflects the live gate's actual job (ranking tokens
+    # at the same vSol). The live monitor refuses to ENTER unless this is > 0.5
+    # — a model that can't discriminate where the gate fires must abstain rather
+    # than bet on the vSol level. NaN for models saved before this was tracked.
+    entry_zone_auc: float = float("nan")
+    # Economic gate (charter §5.4). entry_zone_auc > 0.5 proves the model RANKS
+    # graduations at fixed vSol — but ranking graduations is NOT an economic edge:
+    # most graduations exit at a loss on PumpSwap (median 0.65x), so a sharp ranker
+    # still loses money (DECISIONS [kill] winside-bracket 2026-06-28; the apparent
+    # +99% return was a flat-5x placeholder artifact — measured-win-side it is
+    # -41% to -77%). This flag is True ONLY when a backtest valued at the MEASURED
+    # exit distribution (not the placeholder) shows positive post-cost ENTER return
+    # with bootstrap CI-low > 0. Defaults False so a statistically-sharp-but-
+    # unprofitable model ABSTAINS (WATCH-only). The live ENTER gate requires BOTH
+    # entry_zone_auc > 0.5 AND this. ``economic_ci_low`` is stored for audit.
+    economic_gate_passed: bool = False
+    economic_ci_low: float = float("nan")
 
     def predict(self, X: pd.DataFrame) -> np.ndarray:
         X = X[self.feature_columns]

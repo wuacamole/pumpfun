@@ -38,6 +38,7 @@ def cmd_backtest(args: argparse.Namespace) -> int:
     examples, graduation_prices, stop_exit_multiples = load_examples_from_store(
         args.db, holdout_start_ts=holdout,
         min_first_seen_ts=args.min_first_seen_ts,
+        maturity_sec=(args.maturity_sec if args.maturity_sec else None),
     )
     if not examples:
         print(f"no labelled tokens in {args.db} — collect data first")
@@ -48,11 +49,30 @@ def cmd_backtest(args: argparse.Namespace) -> int:
         "kind": args.kind,
         "n_examples": len(examples),
         "min_first_seen_ts": args.min_first_seen_ts,
+        "maturity_sec": args.maturity_sec,
     }
+    # Empirical win-side fallback: mean real exit price across priced graduations,
+    # used to value UNPRICED graduations instead of the optimistic flat 5x (charter
+    # I2 — move the win-side assumption toward the measured distribution). Disable
+    # with --flat-win-fallback to reproduce the legacy 5x behaviour.
+    empirical_exit_price = None
+    if graduation_prices and not args.flat_win_fallback:
+        px = [float(r["price_sol_per_unit"]) for r in graduation_prices.values()
+              if isinstance(r.get("price_sol_per_unit"), (int, float))
+              and r["price_sol_per_unit"] > 0]
+        if px:
+            empirical_exit_price = sum(px) / len(px)
+    config["win_fallback"] = "flat5x" if empirical_exit_price is None else "empirical_mean"
+    config["empirical_exit_price"] = empirical_exit_price
+    config["n_priced_graduations"] = len(graduation_prices or {})
     run_num = record_backtest_run(config)
     print(f"running walk-forward backtest on {len(examples)} labelled tokens...")
     print(f"  (backtest run #{run_num} — researcher degrees of freedom; "
           f"reported at the §5.4 gate)")
+    if empirical_exit_price is not None:
+        print(f"  win-side fallback: EMPIRICAL mean exit price "
+              f"({len(graduation_prices)} priced grads) for unpriced graduations "
+              f"(not flat 5x)")
     report = run_backtest(
         examples,
         decision_every_sec=args.decision_every,
@@ -60,6 +80,7 @@ def cmd_backtest(args: argparse.Namespace) -> int:
         model_kind=args.kind,
         graduation_prices=graduation_prices,
         stop_exit_multiples=stop_exit_multiples,
+        empirical_exit_price=empirical_exit_price,
     )
     out = write_report(report, args.out)
     print("\n=== backtest report ===")
@@ -68,6 +89,8 @@ def cmd_backtest(args: argparse.Namespace) -> int:
     print(f"  ENTER / WATCH / SKIP: {report.n_enter} / {report.n_watch} / {report.n_skip}")
     print(f"  baseline hit rate   : {report.baseline_hit_rate:.1%}  (P(graduation) overall)")
     print(f"  ENTER hit rate      : {report.enter_hit_rate:.1%}")
+    print(f"  vSol-matched base   : {report.vsol_matched_baseline:.1%}  (P(grad) at the same vSol — the HONEST bar)")
+    print(f"  ENTER lift vs vSol  : {report.enter_lift_vs_vsol:+.1%}  (skill net of vSol confound; ~0 = no real edge)")
     print(f"  ENTER mean return   : {report.enter_mean_return:+.1%}  (post fees/slippage/MEV)")
     print(f"  calibration Brier   : {report.brier_score:.4f}  (lower=better, 0=perfect)")
     print(f"  PR-AUC              : {report.pr_auc:.4f}  (primary for <1% positives)")
@@ -163,6 +186,21 @@ def main() -> None:
         help="exclude tokens whose first swap ts is before this value — the "
              "post-dedup-fix floor for the clean-window backtest (DECISIONS "
              "runs #6/#7). Use 1782517950 for the current post-fix window.",
+    )
+    b.add_argument(
+        "--maturity-sec", type=float, default=3600.0,
+        help="exclude tokens whose first swap ts is within this many seconds of "
+             "the latest observed swap — their outcome is not yet settled "
+             "(right-censoring; recent resolved tokens are fake-graduate-heavy). "
+             "Default 3600 = paper_trade time_stop_sec (1800) + entry/settle "
+             "cushion. Set 0 to disable. See DECISIONS.md [model] 2026-06-27.",
+    )
+    b.add_argument(
+        "--flat-win-fallback", action="store_true",
+        help="value UNPRICED graduations at the legacy flat 5x placeholder "
+             "instead of the empirical mean recovered exit price. Default is the "
+             "empirical fallback (charter I2 — measured > assumed win side). "
+             "Real exits are loss-heavy (median 0.65x), so flat 5x is optimistic.",
     )
     b.add_argument(
         "--holdout-eval", action="store_true",

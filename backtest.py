@@ -98,6 +98,14 @@ class BacktestReport:
     brier_score: float              # calibration of est_grad_prob vs actual (all decisions)
     edge_over_time: list[float]     # rolling enter_hit_rate per fold
     trades: list[TradeOutcome] = field(default_factory=list)
+    # vSol-matched baseline: P(graduate) among ALL decisions at a similar vSol
+    # (breakeven_prob in the ENTER set's IQR). High-vSol tokens graduate
+    # mechanically more, so THIS — not baseline_hit_rate — is the honest bar.
+    # enter_lift_vs_vsol = enter_hit_rate - vsol_matched_baseline is the model's
+    # actual skill net of the vSol-level confound. If it's ~0, the "edge" is an
+    # artifact of entering tokens that were already close to graduation.
+    vsol_matched_baseline: float = float("nan")
+    enter_lift_vs_vsol: float = float("nan")
     # --- Phase 2 exit-gate diagnostics (charter §5.2) ---
     pr_auc: float = float("nan")           # PR-AUC (primary for <1% positives)
     log_loss: float = float("nan")         # log-loss
@@ -230,6 +238,7 @@ def run_backtest(
     entry_bot_share_max: float = 0.6,
     graduation_prices: dict[str, dict[str, object]] | None = None,
     stop_exit_multiples: dict[str, dict[str, object]] | None = None,
+    empirical_exit_price: float | None = None,
     max_decisions_per_token: int = 100,
 ) -> BacktestReport:
     """Walk-forward backtest.
@@ -359,6 +368,18 @@ def run_backtest(
                     pm = row.get("payoff_multiple")
                     if isinstance(pm, (int, float)) and pm > 0:
                         payoff_mult = float(pm)
+            # Unpriced graduation: rather than the optimistic flat 5x default,
+            # plug the EMPIRICAL exit price recovered from the priced graduations
+            # (the unbiased mean-return estimator under price-missingness that is
+            # uncorrelated with outcome — the parse-failure is structural, not
+            # outcome-driven). Per-position: empirical exit price over THIS trade's
+            # bonding-curve entry price. Real exits are loss-heavy (median 0.65x),
+            # so this corrects the win side toward the measured truth (charter I2).
+            if (payoff_mult is None and entered and graduated
+                    and empirical_exit_price is not None and empirical_exit_price > 0):
+                entry_price = curve_price_per_token(vsol)
+                if entry_price > 0:
+                    payoff_mult = float(empirical_exit_price) / entry_price
             # Resolve the loss-side exit multiple from the paper broker's logged
             # stop/time-out fill (charter I2, loss side). When the broker closed
             # a real position for this mint, exit_sol/entry_sol is the actual
@@ -457,17 +478,41 @@ def run_backtest(
     # Fold stability: edge sign positive in every fold of the final window.
     fold_stable = bool(edge_over_time) and all(r > 0 for r in edge_over_time[-3:])
 
+    enter_hit_rate = ((sum(1 for t in enter_trades if t.graduated) / len(enter_trades))
+                      if enter_trades else float("nan"))
+
+    # vSol-matched baseline (the honest bar). The model ENTERs tokens that are
+    # already at high vSol (near graduation), which graduate mechanically more.
+    # Comparing enter_hit_rate to the overall baseline_hit_rate therefore credits
+    # the model for the vSol level, not for skill. Here we ask: among ALL decision
+    # points at a comparable vSol — breakeven_prob in the ENTER set's [P25,P75] —
+    # what fraction belong to tokens that graduated? enter_lift_vs_vsol is the
+    # model's grad-rate skill net of that confound. ~0 means no real edge.
+    vsol_matched = float("nan")
+    enter_lift = float("nan")
+    if enter_trades and trades:
+        be = np.array([t.breakeven_prob for t in enter_trades])
+        lo, hi = np.percentile(be, [25, 75])
+        all_be = np.array([t.breakeven_prob for t in trades])
+        all_g = np.array([1.0 if t.graduated else 0.0 for t in trades])
+        m = (all_be >= lo) & (all_be <= hi)
+        if m.any():
+            vsol_matched = float(all_g[m].mean())
+            if not math.isnan(enter_hit_rate):
+                enter_lift = enter_hit_rate - vsol_matched
+
     return BacktestReport(
         n_tokens=len(items),
         n_decisions=len(trades),
         n_enter=len(enter_trades),
         n_watch=sum(1 for t in trades if t.decision == "WATCH"),
         n_skip=sum(1 for t in trades if t.decision == "SKIP"),
-        enter_hit_rate=(sum(1 for t in enter_trades if t.graduated) / len(enter_trades))
-                       if enter_trades else float("nan"),
+        enter_hit_rate=enter_hit_rate,
         enter_mean_return=float(np.nanmean([t.realized_return for t in enter_trades]))
                            if enter_trades else float("nan"),
         baseline_hit_rate=(n_graduated / len(items)) if items else float("nan"),
+        vsol_matched_baseline=vsol_matched,
+        enter_lift_vs_vsol=enter_lift,
         brier_score=brier,
         edge_over_time=edge_over_time,
         trades=trades,
@@ -498,6 +543,8 @@ def write_report(report: BacktestReport, path: str | Path) -> Path:
         "enter_hit_rate": _safe(report.enter_hit_rate),
         "enter_mean_return": _safe(report.enter_mean_return),
         "baseline_hit_rate": _safe(report.baseline_hit_rate),
+        "vsol_matched_baseline": _safe(report.vsol_matched_baseline),
+        "enter_lift_vs_vsol": _safe(report.enter_lift_vs_vsol),
         "brier_score": _safe(report.brier_score),
         "pr_auc": _safe(report.pr_auc),
         "log_loss": _safe(report.log_loss),
@@ -530,6 +577,7 @@ def load_examples_from_store(
     *,
     holdout_start_ts: float | None = None,
     min_first_seen_ts: float | None = None,
+    maturity_sec: float | None = None,
 ) -> tuple[
     list[tuple[str, list[Swap], str, CreatorHistory | None]],
     dict[str, dict[str, object]],
@@ -563,11 +611,28 @@ def load_examples_from_store(
     backtest (DECISIONS runs #6/#7) — pre-fix tokens carry receipt-time-
     duplicated swaps that inflate per-token features and must not be cited as
     gate evidence. Replaces the ad-hoc in-memory filter scripts those runs used.
+
+    ``maturity_sec``: when set, tokens whose first swap ts is > (latest observed
+    swap ts − maturity_sec) are *excluded* — their outcome is not yet settled.
+    Graduation labels are real-time (migrate event) but a 'stalled' label is only
+    written when the paper broker times a position out at entry + time_stop_sec
+    (paper_trade.PaperBroker.time_stop_sec = 1800s / 30 min), so the most-recent
+    cohort is RIGHT-CENSORED: its resolved tokens are artificially graduate-heavy
+    (graduation rate by launch hour climbs to a fake 100% in the final hours).
+    Training/eval on that tail learns a "launched late ⇒ graduates" leak. The CLI
+    default is 3600 = time_stop_sec (1800) + entry-lag/settle cushion (~1800);
+    widen it if time_stop_sec grows. See DECISIONS.md [model] 2026-06-27
+    (route-feature-test) for the discovery.
     """
     from model import CreatorHistory
     from storage import Store
     s = Store(store_db, auto_dedupe=False)
     examples: list[tuple[str, list[Swap], str, CreatorHistory | None]] = []
+    max_first_seen_ts: float | None = None
+    if maturity_sec is not None:
+        row = s.conn.execute("SELECT MAX(ts) FROM swaps").fetchone()
+        if row and row[0] is not None:
+            max_first_seen_ts = float(row[0]) - maturity_sec
     # Build the full creator-history index once; we'll filter per-token by the
     # creator's outcomes known before that token's launch. Doing one query per
     # token would be O(tokens) RPCs; this is one scan + an in-memory lookup.
@@ -596,6 +661,8 @@ def load_examples_from_store(
             continue  # holdout — not for training/selection
         if min_first_seen_ts is not None and swaps[0].ts < min_first_seen_ts:
             continue  # pre-fix contaminated window — exclude from clean run
+        if max_first_seen_ts is not None and swaps[0].ts > max_first_seen_ts:
+            continue  # right-censored tail — outcome not yet settled
         # No-lookahead creator history: count this creator's resolved outcomes
         # whose outcome_ts precedes this token's first swap. A creator whose
         # earlier token graduated at ts=200 must not contribute to a token

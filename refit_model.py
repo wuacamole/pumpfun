@@ -31,14 +31,39 @@ ENTRY_VSOL = 36.0
 SNAP_EVERY_SEC = 20.0  # sample a decision point this often along the trajectory
 MIN_SWAPS = 5
 MAX_SNAPS = 15         # cap per token so a long-lived token can't dominate
+# Outcome-maturity guard. Exclude tokens whose first swap is within this many
+# seconds of the latest observed swap — their outcome is not yet settled.
+# Graduation labels are real-time (migrate event) but a 'stalled' label is only
+# written when the paper broker times a position out at entry + time_stop_sec
+# (paper_trade.PaperBroker.time_stop_sec = 1800s / 30 min), so the recent cohort
+# is RIGHT-CENSORED: its resolved tokens are fake-graduate-heavy and the model
+# would learn a "launched late => graduates" leak. Buffer = time_stop_sec (1800)
+# + entry-lag/settle cushion (~1800) = 3600. Bump this if time_stop_sec grows.
+# See DECISIONS.md [model] 2026-06-27 (route-feature-test). 0 disables.
+MATURITY_SEC = 3600.0
 GRAD_VSOL = get_cached_constants().v_sol_graduation
+# Minimum entry-zone (33-50 vSol) time-ordered OOS AUC required to deploy a
+# model. <= 0.5 means no discrimination where the live gate fires; refuse to
+# ship it (it would be a vSol-level detector at best, inverted at worst).
+ENTRY_ZONE_AUC_DEPLOY_MIN = 0.5
 
 
 def _load_tokens():
     c = sqlite3.connect(DB)
     c.row_factory = sqlite3.Row
     out = []
-    for r in c.execute("SELECT mint,outcome FROM tokens WHERE outcome IN ('graduated','stalled')"):
+    # Right-censoring guard: drop the not-yet-settled recent tail (see MATURITY_SEC).
+    mature_clause = ""
+    params: tuple = ()
+    if MATURITY_SEC:
+        max_ts = c.execute("SELECT MAX(ts) FROM swaps").fetchone()[0]
+        if max_ts is not None:
+            mature_clause = " AND first_seen_ts <= ?"
+            params = (max_ts - MATURITY_SEC,)
+    for r in c.execute(
+        "SELECT mint,outcome FROM tokens WHERE outcome IN ('graduated','stalled')"
+        + mature_clause, params,
+    ):
         swaps = [
             Swap(ts=s["ts"], wallet=s["wallet"], is_buy=bool(s["is_buy"]),
                  sol_amount=s["sol_amount"], vsol_after=s["vsol_after"],
@@ -180,6 +205,12 @@ def main():
         print(f"  {kind:>8}: overall AUC={overall:.3f}  entry-zone[33-50] AUC={ez_auc:.3f}  Brier={brier:.3f}")
 
     print("\n=== time-ordered expanding-window OOS (honest — predicts the future) ===")
+    # Select by ENTRY-ZONE AUC, not overall AUC. Overall AUC is dominated by the
+    # trivial vSol-level signal (a snapshot near graduation obviously graduates;
+    # vSol alone scores ~0.86 OOS), so picking the highest-overall-AUC model
+    # selects for "knows vSol", not for the skill the live gate needs: ranking
+    # tokens *at the same vSol*. The gate fires in [33,50] vSol, so that's the
+    # metric that matters. See DECISIONS.md [kill] 2026-06-27 (vSol-confound).
     best = None
     for kind in ("logistic", "gbm"):
         oof, yy, valid = time_ordered_cv(df, kind)
@@ -198,13 +229,29 @@ def main():
         n_eval = int(valid.sum())
         print(f"  {kind:>8}: overall AUC={overall:.3f}  entry-zone[33-50] AUC={ez_auc:.3f}  "
               f"Brier={brier:.3f}  (n={n_eval} valid snapshots)")
-        if best is None or overall > best[1]:
-            best = (kind, overall, oof, valid)
+        # Rank by entry-zone AUC (NaN sorts last). Tie-break on overall.
+        score = (ez_auc if ez_auc == ez_auc else -1.0)
+        if best is None or score > best[1]:
+            best = (kind, score, oof, valid, overall)
 
     if best is None:
         print("\nno valid time-ordered folds — not enough data; aborting refit")
         return
-    kind, _, oof, valid = best
+    kind, best_ez_auc, oof, valid, _ = best
+
+    # Deploy guard: refuse to ship a model with no entry-zone discrimination.
+    # entry-zone AUC <= 0.5 means it ranks future-graduates at or below
+    # future-failures *at the same vSol* — i.e. it is inverted/useless exactly
+    # where the live gate uses it. Shipping it would fire ENTERs on the model's
+    # most-confident-but-least-likely tokens (the observed failure mode). Keep
+    # the previous model on disk and abstain rather than deploy an anti-signal.
+    if not (best_ez_auc > ENTRY_ZONE_AUC_DEPLOY_MIN):
+        print(f"\nREFUSING TO DEPLOY: best entry-zone AUC={best_ez_auc:.3f} "
+              f"<= {ENTRY_ZONE_AUC_DEPLOY_MIN} (no discrimination where the gate "
+              f"fires). The model is a vSol-level detector, not a conviction "
+              f"predictor — see DECISIONS.md [kill] (vSol confound). latest.pkl "
+              f"left unchanged; the live gate should abstain (WATCH-only).")
+        return
     print(f"\n=== {kind} time-ordered OOS calibration across the whole trajectory ===")
     y_valid = y[valid]
     for lo, hi in [(0,.2),(.2,.4),(.4,.6),(.6,.8),(.8,1.01)]:
@@ -222,7 +269,9 @@ def main():
                 shutil.copy(p, ms.dir / f"backup_{int(_t.time())}.{e}")
         print("\nbacked up previous model")
     final = fit(df, kind=kind, calibrate=True)
-    print(f"saved {kind} -> {ms.save(final,'latest')}  (in-sample Brier={final.brier_score:.3f})")
+    final.entry_zone_auc = float(best_ez_auc)  # the metric the live gate trusts
+    print(f"saved {kind} -> {ms.save(final,'latest')}  (in-sample Brier={final.brier_score:.3f}, "
+          f"entry-zone OOS AUC={best_ez_auc:.3f})")
     print("note: time-ordered OOS AUC above is the honest metric; in-sample Brier is optimistic")
 
 
