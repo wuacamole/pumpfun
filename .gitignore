@@ -14,6 +14,7 @@ wheels/
 .env.*
 *.pem
 *.key
+pumpfun-portable.tar.gz
 
 # Local stores / snapshots / models / logs
 *.db
